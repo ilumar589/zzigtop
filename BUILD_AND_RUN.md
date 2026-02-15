@@ -98,3 +98,37 @@ zig build run-server -Doptimize=ReleaseFast
 # Pass arguments (e.g. custom port)
 zig build run-server -- --port 3000
 ```
+
+---
+
+## Running Tests
+
+### Test Script
+
+Use `test.ps1` for a visual test runner with color-coded output:
+
+```powershell
+# Run all tests (summary only)
+powershell -ExecutionPolicy Bypass -File test.ps1
+
+# Run all tests with each test name listed
+powershell -ExecutionPolicy Bypass -File test.ps1 -Verbose
+```
+
+**Summary mode** shows a pass/fail count and elapsed time.  
+**Verbose mode** lists every individual test with `[PASS]` or `[FAIL]` next to it.
+
+If any tests fail, the script shows which tests failed and the relevant error details.
+
+### Zig Build Commands (without test.ps1)
+
+```powershell
+# Run all tests
+zig build test
+
+# Run all tests with summary
+zig build test --summary all
+
+# Run tests on the root module directly
+zig test src/root.zig
+```
