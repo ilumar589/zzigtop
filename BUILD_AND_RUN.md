@@ -108,27 +108,56 @@ zig build run-server -- --port 3000
 Use `test.ps1` for a visual test runner with color-coded output:
 
 ```powershell
-# Run all tests (summary only)
+# Run unit tests only (default)
 powershell -ExecutionPolicy Bypass -File test.ps1
 
-# Run all tests with each test name listed
+# Run unit tests with each test name listed
 powershell -ExecutionPolicy Bypass -File test.ps1 -Verbose
+
+# Run integration tests (starts server, sends real HTTP requests)
+powershell -ExecutionPolicy Bypass -File test.ps1 -Integration
+
+# Run benchmarks (ReleaseFast, measures throughput & latency)
+powershell -ExecutionPolicy Bypass -File test.ps1 -Benchmark
+
+# Run everything: unit + integration + benchmark
+powershell -ExecutionPolicy Bypass -File test.ps1 -All
+
+# Combine flags as needed
+powershell -ExecutionPolicy Bypass -File test.ps1 -Integration -Verbose
 ```
 
-**Summary mode** shows a pass/fail count and elapsed time.  
-**Verbose mode** lists every individual test with `[PASS]` or `[FAIL]` next to it.
+### Test Script Parameters
 
-If any tests fail, the script shows which tests failed and the relevant error details.
+| Parameter       | Description                                                    |
+|-----------------|----------------------------------------------------------------|
+| `-Verbose`      | List every individual test with `[PASS]` / `[FAIL]` markers   |
+| `-Integration`  | Run integration tests (end-to-end HTTP over TCP)               |
+| `-Benchmark`    | Run performance benchmarks (built with `-Doptimize=ReleaseFast`) |
+| `-All`          | Run all phases: unit tests, integration tests, and benchmarks  |
+
+With no flags, only unit tests are run.
+
+### What Each Phase Tests
+
+| Phase         | Count | What it covers |
+|---------------|-------|----------------|
+| **Unit**      | 64    | Parser, router, request, response — pure logic, no I/O |
+| **Integration** | 10  | Full HTTP request/response cycle over real TCP sockets |
+| **Benchmark** | 4     | Throughput & latency under concurrent load (ReleaseFast) |
 
 ### Zig Build Commands (without test.ps1)
 
 ```powershell
-# Run all tests
+# Run unit tests
 zig build test
 
-# Run all tests with summary
+# Run unit tests with summary
 zig build test --summary all
 
-# Run tests on the root module directly
-zig test src/root.zig
+# Run integration tests (starts server, sends HTTP requests, validates responses)
+zig build integration-test
+
+# Run benchmarks (use ReleaseFast for meaningful numbers)
+zig build benchmark -Doptimize=ReleaseFast
 ```

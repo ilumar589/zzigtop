@@ -138,6 +138,44 @@ pub fn build(b: *std.Build) void {
         run_cmd.addArgs(args);
     }
 
+    // ---- Integration Test Executable ----
+    const integration_test_exe = b.addExecutable(.{
+        .name = "integration_test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/integration_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "learn_zig", .module = mod },
+            },
+        }),
+    });
+    b.installArtifact(integration_test_exe);
+
+    const run_integration_test_step = b.step("integration-test", "Run HTTP integration tests");
+    const run_integration_test_cmd = b.addRunArtifact(integration_test_exe);
+    run_integration_test_step.dependOn(&run_integration_test_cmd.step);
+    run_integration_test_cmd.step.dependOn(b.getInstallStep());
+
+    // ---- Benchmark Executable ----
+    const benchmark_exe = b.addExecutable(.{
+        .name = "benchmark",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/benchmark.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "learn_zig", .module = mod },
+            },
+        }),
+    });
+    b.installArtifact(benchmark_exe);
+
+    const run_benchmark_step = b.step("benchmark", "Run HTTP server benchmark");
+    const run_benchmark_cmd = b.addRunArtifact(benchmark_exe);
+    run_benchmark_step.dependOn(&run_benchmark_cmd.step);
+    run_benchmark_cmd.step.dependOn(b.getInstallStep());
+
     // Creates an executable that will run `test` blocks from the provided module.
     // Here `mod` needs to define a target, which is why earlier we made sure to
     // set the releative field.
