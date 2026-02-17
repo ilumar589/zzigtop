@@ -17,10 +17,11 @@ pub fn main(init: std.process.Init) !void {
         .{ .POST, "/api/echo", handleEcho },
     });
 
-    // Create and start server
+    // Create and start server (with thread pool)
     var server = try http.Server.start(gpa, io, .{
         .port = 8080,
         .router = &router,
+        .thread_pool_size = 8,  // 0 = auto-detect (CPU count)
     });
     defer server.deinit(io);
 
@@ -51,7 +52,8 @@ fn handleEcho(request: *http.Request, response: *http.Response) !void {
 
 ### `http.Server`
 
-The main server type. Listens for TCP connections and dispatches them to handlers.
+The main server type. Listens for TCP connections and dispatches them to a
+fixed-size thread pool for handling.
 
 ```zig
 const Server = struct {
@@ -75,8 +77,8 @@ const Server = struct {
 | `host` | `[4]u8` | `{0,0,0,0}` | Bind address (0.0.0.0 = all interfaces) |
 | `backlog` | `u31` | `128` | Kernel connection backlog |
 | `router` | `*const Router` | required | Route table |
-| `read_buffer_size` | `usize` | `8192` | Per-connection read buffer |
-| `write_buffer_size` | `usize` | `8192` | Per-connection write buffer |
+| `thread_pool_size` | `u32` | `0` | Worker threads (0 = CPU count) |
+| `max_pending_connections` | `u32` | `128` | Max queued connections before backpressure |
 
 ### `http.Router`
 
@@ -154,12 +156,21 @@ zig build run-server
 # Build with max performance
 zig build run-server -Doptimize=ReleaseFast
 
+# Custom port and thread count
+zig build run-server -- --port 3000 --threads 8
+
 # Build only
 zig build -Doptimize=ReleaseFast
 
 # Run the built binary directly
-.\zig-out\bin\http_server.exe
+.\zig-out\bin\http_server.exe --port 3000 --threads 4
 ```
+
+**CLI arguments:**
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--port` | `8080` | TCP port to listen on |
+| `--threads` | CPU count | Number of worker threads |
 
 ## Handler Function Signature
 
@@ -178,4 +189,5 @@ Where `HandlerError` allows returning standard errors.
 - Avoid storing references to request data beyond the handler's lifetime 
   (data lives in the connection's read buffer)
 - For static responses, use comptime strings — they're free
-- Keep handlers non-blocking; each connection has its own thread
+- Keep handlers non-blocking; the thread pool has a fixed number of workers,
+  so a blocked handler reduces capacity for other connections

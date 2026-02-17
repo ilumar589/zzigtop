@@ -56,6 +56,9 @@
 # Run the server on a custom port
 .\run.ps1 -Server -Optimize ReleaseFast -- --port 3000
 
+# Run the server with a specific thread pool size
+.\run.ps1 -Server -Optimize ReleaseFast -- --port 3000 --threads 8
+
 # Only build the server, don't run it
 .\run.ps1 -Server -BuildOnly
 
@@ -95,8 +98,8 @@ zig build run-server
 # Build and run the HTTP server with max performance
 zig build run-server -Doptimize=ReleaseFast
 
-# Pass arguments (e.g. custom port)
-zig build run-server -- --port 3000
+# Pass arguments (e.g. custom port and thread count)
+zig build run-server -- --port 3000 --threads 8
 ```
 
 ---
@@ -144,7 +147,7 @@ With no flags, only unit tests are run.
 |---------------|-------|----------------|
 | **Unit**      | 64    | Parser, router, request, response — pure logic, no I/O |
 | **Integration** | 10  | Full HTTP request/response cycle over real TCP sockets |
-| **Benchmark** | 4     | Throughput & latency under concurrent load (ReleaseFast) |
+| **Benchmark** | 6     | Throughput & latency: conn-per-req + keep-alive (ReleaseFast) |
 
 ### Zig Build Commands (without test.ps1)
 

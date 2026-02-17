@@ -1,8 +1,9 @@
-//! TCP server with thread-per-connection model.
+//! TCP server with configurable thread pool.
 //!
-//! Listens on a TCP port and spawns a new thread for each
-//! incoming connection. Each thread runs the connection handler
-//! which manages keep-alive, parsing, routing, and response.
+//! Listens on a TCP port and dispatches incoming connections to a
+//! fixed-size thread pool. Each worker thread handles the full
+//! lifecycle of a connection (keep-alive, parsing, routing, response).
+//! This avoids the cost of spawning a new OS thread per connection.
 
 const std = @import("std");
 const Io = std.Io;
@@ -11,6 +12,7 @@ const mem = std.mem;
 
 const Router = @import("router.zig");
 const Connection = @import("connection.zig");
+const ThreadPool = @import("thread_pool.zig");
 
 const Server = @This();
 
@@ -26,6 +28,10 @@ pub const Config = struct {
     reuse_address: bool = true,
     /// The router to use for dispatching requests.
     router: *const Router,
+    /// Number of worker threads. 0 = auto-detect (CPU count).
+    thread_pool_size: u32 = 0,
+    /// Maximum connections waiting in the thread pool queue.
+    max_pending_connections: u32 = 128,
 };
 
 /// The underlying TCP server.
@@ -34,10 +40,13 @@ tcp_server: net.Server,
 router: *const Router,
 /// Allocator used for per-request arenas and internal allocations.
 allocator: std.mem.Allocator,
+/// Thread pool for handling connections.
+pool: ThreadPool,
 
 /// Start listening on the configured address.
 ///
 /// Returns a Server ready for `run()` to be called.
+/// Spawns worker threads immediately.
 pub fn start(allocator: std.mem.Allocator, io: Io, config: Config) !Server {
     const address: net.IpAddress = .{
         .ip4 = .{
@@ -51,18 +60,27 @@ pub fn start(allocator: std.mem.Allocator, io: Io, config: Config) !Server {
         .reuse_address = config.reuse_address,
     });
 
-    return .{
+    var server: Server = .{
         .tcp_server = tcp_server,
         .router = config.router,
         .allocator = allocator,
+        .pool = undefined,
     };
+
+    server.pool = try ThreadPool.init(allocator, io, config.router, .{
+        .num_threads = config.thread_pool_size,
+        .max_pending = config.max_pending_connections,
+    });
+
+    return server;
 }
 
 /// Run the accept loop.
 ///
-/// Blocks forever, accepting incoming connections and spawning
-/// a new thread for each one. Each thread handles the full
-/// lifecycle of that connection (keep-alive, multiple requests).
+/// Blocks forever, accepting incoming connections and submitting
+/// them to the thread pool for handling. If the pool queue is full,
+/// the accept loop blocks until a worker becomes available
+/// (natural backpressure).
 pub fn run(self: *Server, io: Io) void {
     while (true) {
         // Accept a new connection (blocks until one arrives).
@@ -80,31 +98,13 @@ pub fn run(self: *Server, io: Io) void {
             }
         };
 
-        // Spawn a detached thread to handle this connection.
-        // The thread owns the stream and will close it when done.
-        const thread = std.Thread.spawn(.{}, connectionThread, .{
-            stream,
-            io,
-            self.router,
-            self.allocator,
-        }) catch |err| {
-            @branchHint(.unlikely);
-            std.debug.print("Thread spawn error: {}\n", .{err});
-            stream.close(io);
-            continue;
-        };
-
-        // Detach — we don't join connection threads.
-        thread.detach();
+        // Submit to the thread pool (blocks if queue is full).
+        self.pool.submit(stream);
     }
-}
-
-/// Entry point for a connection-handling thread.
-fn connectionThread(stream: net.Stream, io: Io, router: *const Router, allocator: std.mem.Allocator) void {
-    Connection.handle(allocator, stream, io, router);
 }
 
 /// Clean up server resources.
 pub fn deinit(self: *Server, io: Io) void {
+    self.pool.shutdown(io);
     self.tcp_server.deinit(io);
 }

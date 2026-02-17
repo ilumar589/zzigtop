@@ -3,7 +3,7 @@
 //! Manages the lifecycle of a single TCP connection:
 //! - Buffered I/O with stack-allocated buffers
 //! - HTTP/1.1 keep-alive loop (multiple requests per connection)
-//! - Arena-per-request allocation pattern
+//! - Thread-local arena reset between requests (O(1) via retain_capacity)
 //! - Delegates to std.http.Server for protocol parsing
 
 const std = @import("std");
@@ -31,12 +31,16 @@ pub const Config = struct {
 /// 1. Creates buffered reader/writer over the TCP stream
 /// 2. Initializes std.http.Server for protocol parsing
 /// 3. Loops over requests (keep-alive)
-/// 4. For each request: routes to handler, sends response
+/// 4. For each request: resets thread arena, routes to handler, sends response
 /// 5. Cleans up when connection closes
+///
+/// The arena is owned by the worker thread and reset between requests
+/// with `.retain_capacity` — an O(1) operation that reuses existing
+/// memory without touching the backing allocator.
 ///
 /// All I/O buffers are stack-allocated for maximum performance.
 pub fn handle(
-    allocator: std.mem.Allocator,
+    arena_state: *std.heap.ArenaAllocator,
     stream: Io.net.Stream,
     io: Io,
     router: *const Router,
@@ -68,11 +72,12 @@ pub fn handle(
             break;
         };
 
-        // ---- Arena per request ----
-        // All allocations during this request go through this arena.
-        // When the request is done, everything is freed in one O(1) operation.
-        var arena_state: std.heap.ArenaAllocator = .init(allocator);
-        defer arena_state.deinit();
+        // ---- Reset thread-local arena for this request ----
+        // retain_capacity keeps the underlying memory pages allocated,
+        // just resets the bump pointer. Future allocations reuse the
+        // same memory without any syscalls. Over time the arena converges
+        // to a single chunk that fits all request data.
+        _ = arena_state.reset(.retain_capacity);
         const arena = arena_state.allocator();
 
         // Build our Request wrapper.

@@ -24,10 +24,18 @@ A from-scratch HTTP/1.1 server built in Zig 0.16, designed to maximize performan
 │              Server (server.zig)                 │
 │  - Binds to address via std.Io.net.listen()     │
 │  - Accept loop                                  │
-│  - Spawns thread per connection                 │
+│  - Submits connections to thread pool           │
 │  - Manages server lifecycle                     │
 └───────────────────┬─────────────────────────────┘
-                    │ (per connection)
+                    │
+┌───────────────────▼─────────────────────────────┐
+│         Thread Pool (thread_pool.zig)            │
+│  - Fixed number of pre-spawned worker threads   │
+│  - Bounded Io.Queue for connection dispatch     │
+│  - Backpressure when queue is full              │
+│  - Graceful shutdown via queue close            │
+└───────────────────┬─────────────────────────────┘
+                    │ (per connection, from pool worker)
 ┌───────────────────▼─────────────────────────────┐
 │         Connection (connection.zig)              │
 │  - Wraps std.http.Server for HTTP parsing       │
@@ -60,7 +68,8 @@ A from-scratch HTTP/1.1 server built in Zig 0.16, designed to maximize performan
 
 ```
 http.zig (module root)
-├── server.zig      → connection.zig, router.zig
+├── server.zig      → thread_pool.zig, connection.zig, router.zig
+├── thread_pool.zig → connection.zig, router.zig
 ├── connection.zig  → request.zig, response.zig, router.zig, parser.zig
 ├── router.zig      → request.zig, response.zig
 ├── request.zig     → parser.zig
@@ -73,8 +82,8 @@ http.zig (module root)
 ### 1. Build on std.http.Server
 Zig 0.16's `std.http.Server` already has excellent HTTP/1.1 parsing with zero-copy header access. Rather than reimplementing, we wrap it and add routing, connection management, and performance layers.
 
-### 2. Thread-per-Connection
-For simplicity and broad OS compatibility (including Windows where io_uring isn't available), we use a thread-per-connection model. Each connection gets its own thread via `std.Thread.spawn`. This is effective for moderate concurrency and avoids callback-based complexity.
+### 2. Thread Pool
+Connections are dispatched to a fixed-size thread pool backed by a bounded `Io.Queue`. This avoids the overhead of spawning (and tearing down) an OS thread per connection. The pool size defaults to CPU count but is configurable via `--threads`. When the queue is full, the accept loop blocks, providing natural backpressure. Each worker thread handles one connection at a time, running the keep-alive loop internally so a single worker can serve many sequential requests.
 
 ### 3. Arena-per-Request
 Each HTTP request gets a dedicated arena allocator. All allocations during request processing (route params, parsed data, response building) use this arena. When the request completes, the entire arena is freed in a single O(1) operation.
@@ -103,7 +112,8 @@ Response status line + headers + body are combined into a single vectored write 
 src/
 ├── http/
 │   ├── http.zig          — Module root, re-exports all public types
-│   ├── server.zig        — TCP accept loop, thread spawning
+│   ├── server.zig        — TCP accept loop, thread pool dispatch
+│   ├── thread_pool.zig   — Fixed-size thread pool with Io.Queue
 │   ├── connection.zig    — Per-connection HTTP handling, keep-alive
 │   ├── router.zig        — Comptime route table, path matching
 │   ├── request.zig       — HTTP request wrapper with arena
@@ -127,25 +137,29 @@ build.zig.zon             — Package metadata
 Main Thread (owns allocator + Io)
 │
 ├─ Server.start(allocator, io, config)
-│   └─ stores allocator in Server struct
+│   ├─ stores allocator in Server struct
+│   └─ ThreadPool.init(allocator, io, router, pool_config)
+│       └─ spawns N worker threads (default: CPU count)
 │
 ├─ Accept Loop (blocking)
-│   ├─ accept() → spawn Thread A (allocator, io, router)
-│   ├─ accept() → spawn Thread B (allocator, io, router)
-│   └─ accept() → spawn Thread C (allocator, io, router)
+│   ├─ accept() → pool.submit(stream)  ← push to bounded queue
+│   ├─ accept() → pool.submit(stream)
+│   └─ accept() → pool.submit(stream)  (blocks if queue full)
 │
-Thread A                Thread B                Thread C
-│                       │                       │
-├─ Connection.handle(allocator, ...)
+Worker 1              Worker 2              Worker 3
+│                     │                     │
+├─ getOneUncancelable() ← blocks on queue
+├─ Connection.handle(allocator, stream, ...)
 ├─ ArenaAllocator.init(allocator)  ← explicit backing allocator
-├─ Read request         ├─ Read request         ├─ Read request
-├─ Parse headers        ├─ Parse headers        ├─ Parse headers
-├─ Route match          ├─ Route match          ├─ Route match
-├─ Call handler         ├─ Call handler          ├─ Call handler
-├─ Write response       ├─ Write response       ├─ Write response
-├─ arena.deinit()       ├─ arena.deinit()       ├─ arena.deinit()
-├─ (keep-alive loop)    ├─ (keep-alive loop)    ├─ Close
-└─ Close                └─ Close
+├─ Read request       ├─ Read request       ├─ Read request
+├─ Parse headers      ├─ Parse headers      ├─ Parse headers
+├─ Route match        ├─ Route match        ├─ Route match
+├─ Call handler       ├─ Call handler        ├─ Call handler
+├─ Write response     ├─ Write response     ├─ Write response
+├─ arena.deinit()     ├─ arena.deinit()     ├─ arena.deinit()
+├─ (keep-alive loop)  ├─ (keep-alive loop)  ├─ Close
+├─ Close              └─ Close
+└─ back to getOneUncancelable()  ← reused for next connection
 ```
 
 ## Memory Model

@@ -54,13 +54,19 @@ const BenchConfig = struct {
     path: []const u8 = "/",
     /// Name for display.
     name: []const u8 = "GET /",
+    /// Whether to reuse the TCP connection (keep-alive) across requests.
+    keep_alive: bool = false,
 };
 
 const benchmarks = [_]BenchConfig{
-    .{ .name = "GET / (plaintext)", .path = "/", .num_threads = 4, .requests_per_thread = 10_000 },
-    .{ .name = "GET /json (JSON)", .path = "/json", .num_threads = 4, .requests_per_thread = 10_000 },
-    .{ .name = "GET /param/:id (path param)", .path = "/param/42", .num_threads = 4, .requests_per_thread = 10_000 },
-    .{ .name = "GET / (high concurrency)", .path = "/", .num_threads = 16, .requests_per_thread = 5_000 },
+    // -- Connection-per-request (baseline) --
+    .{ .name = "GET / (conn-per-req)", .path = "/", .num_threads = 4, .requests_per_thread = 10_000 },
+    .{ .name = "GET /json (conn-per-req)", .path = "/json", .num_threads = 4, .requests_per_thread = 10_000 },
+    // -- Keep-alive (connection reuse) --
+    .{ .name = "GET / (keep-alive)", .path = "/", .num_threads = 4, .requests_per_thread = 10_000, .keep_alive = true },
+    .{ .name = "GET /json (keep-alive)", .path = "/json", .num_threads = 4, .requests_per_thread = 10_000, .keep_alive = true },
+    .{ .name = "GET /param/:id (keep-alive)", .path = "/param/42", .num_threads = 4, .requests_per_thread = 10_000, .keep_alive = true },
+    .{ .name = "GET / (keep-alive, 16 threads)", .path = "/", .num_threads = 16, .requests_per_thread = 5_000, .keep_alive = true },
 };
 
 // ============================================================================
@@ -75,6 +81,7 @@ const WorkerResult = struct {
     max_latency_ns: u64 = 0,
 };
 
+/// Connection-per-request benchmark worker.
 fn benchmarkWorker(io: Io, path: []const u8, num_requests: u32) WorkerResult {
     var result: WorkerResult = .{};
     var buf: [4096]u8 = undefined;
@@ -134,6 +141,92 @@ fn benchmarkWorker(io: Io, path: []const u8, num_requests: u32) WorkerResult {
     return result;
 }
 
+/// Keep-alive benchmark worker — reuses a single TCP connection for all requests.
+fn keepaliveBenchmarkWorker(io: Io, path: []const u8, num_requests: u32) WorkerResult {
+    var result: WorkerResult = .{};
+    var buf: [8192]u8 = undefined;
+
+    var req_buf: [512]u8 = undefined;
+    const request_bytes = std.fmt.bufPrint(&req_buf, "GET {s} HTTP/1.1\r\nHost: localhost\r\n\r\n", .{path}) catch return result;
+
+    const address: net.IpAddress = .{
+        .ip4 = .{
+            .bytes = .{ 127, 0, 0, 1 },
+            .port = bench_port,
+        },
+    };
+
+    const stream = net.IpAddress.connect(address, io, .{ .mode = .stream }) catch return result;
+    defer stream.close(io);
+
+    var read_buffer: [8192]u8 = undefined;
+    var write_buffer: [8192]u8 = undefined;
+
+    var reader = stream.reader(io, &read_buffer);
+    var writer = stream.writer(io, &write_buffer);
+
+    for (0..num_requests) |_| {
+        const start = Io.Timestamp.now(io, .awake);
+
+        const success = blk: {
+            writer.interface.writeAll(request_bytes) catch break :blk false;
+            writer.interface.flush() catch break :blk false;
+
+            // Read until we have the full response (headers + body).
+            // We need to parse Content-Length to know where the response ends.
+            var total: usize = 0;
+            while (total < buf.len) {
+                var iov = [1][]u8{buf[total..]};
+                const n = reader.interface.readVec(&iov) catch break;
+                if (n == 0) break;
+                total += n;
+
+                // Check if we have the complete response
+                if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n")) |hdr_end| {
+                    const body_start = hdr_end + 4;
+                    if (findContentLengthInHeaders(buf[0..hdr_end])) |cl| {
+                        if (total - body_start >= cl) break;
+                    } else {
+                        break; // No Content-Length, assume done
+                    }
+                }
+            }
+
+            break :blk total > 0 and buf[9] == '2';
+        };
+
+        const end = Io.Timestamp.now(io, .awake);
+        const latency: u64 = @intCast(start.durationTo(end).nanoseconds);
+
+        if (success) {
+            result.successful += 1;
+            result.total_latency_ns += latency;
+            if (latency < result.min_latency_ns) result.min_latency_ns = latency;
+            if (latency > result.max_latency_ns) result.max_latency_ns = latency;
+        } else {
+            result.failed += 1;
+        }
+    }
+
+    return result;
+}
+
+/// Parse Content-Length from raw header bytes.
+fn findContentLengthInHeaders(headers: []const u8) ?usize {
+    var i: usize = 0;
+    while (i < headers.len) {
+        const line_end = std.mem.indexOfPos(u8, headers, i, "\r\n") orelse headers.len;
+        const line = headers[i..line_end];
+
+        if (line.len > 16 and std.ascii.eqlIgnoreCase(line[0..16], "content-length: ")) {
+            return std.fmt.parseInt(usize, line[16..], 10) catch null;
+        }
+
+        i = if (line_end + 2 <= headers.len) line_end + 2 else headers.len;
+    }
+    return null;
+}
+
 fn runBenchmark(io: Io, config: BenchConfig) void {
     std.debug.print("  {s}\n", .{config.name});
     std.debug.print("    Threads: {d}, Requests/thread: {d}, Total: {d}\n", .{
@@ -152,10 +245,10 @@ fn runBenchmark(io: Io, config: BenchConfig) void {
 
     for (0..config.num_threads) |i| {
         threads[i] = std.Thread.spawn(.{}, struct {
-            fn run(sio: Io, path: []const u8, n: u32, out: *WorkerResult) void {
-                out.* = benchmarkWorker(sio, path, n);
+            fn run(sio: Io, path: []const u8, n: u32, out: *WorkerResult, ka: bool) void {
+                out.* = if (ka) keepaliveBenchmarkWorker(sio, path, n) else benchmarkWorker(sio, path, n);
             }
-        }.run, .{ io, config.path, config.requests_per_thread, &results[i] }) catch {
+        }.run, .{ io, config.path, config.requests_per_thread, &results[i], config.keep_alive }) catch {
             std.debug.print("    \x1b[31mFailed to spawn thread {d}\x1b[0m\n", .{i});
             return;
         };

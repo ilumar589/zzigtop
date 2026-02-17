@@ -4,7 +4,7 @@
 
 > **Last Updated:** 2026-02-17  
 > **Zig Version:** 0.16.0-dev.2535+b5bd49460  
-> **Status:** STEP 10 COMPLETE — All tests passing (64 unit + 10 integration), benchmarks done
+> **Status:** STEP 10 COMPLETE — All tests passing (64 unit + 10 integration), thread pool + benchmarks done
 
 ---
 
@@ -145,7 +145,8 @@
 **Performance tricks applied:**
 - SO_REUSEADDR for fast restarts
 - Configurable backlog for burst handling
-- Thread spawning per connection (simple, effective)
+- **Fixed-size thread pool** with `Io.Queue`-based bounded work queue (replaced thread-per-connection)
+- Configurable worker count (default: CPU count) and queue depth
 - No hardcoded allocators — caller controls allocation strategy
 
 ---
@@ -201,15 +202,23 @@ zig build run-server -Doptimize=ReleaseFast  # Max performance
 | Different param values | Path params work with various inputs |
 | HTTP/1.0 request | Backwards compatibility with HTTP/1.0 |
 
-**Benchmark results (ReleaseFast, Windows, connection-per-request):**
+**Benchmark results (ReleaseFast, Windows, thread pool):**
+
+*Connection-per-request (each request opens a new TCP connection):*
 | Benchmark | Threads | Requests | Throughput | Avg Latency | Min Latency |
 |-----------|---------|----------|------------|-------------|-------------|
-| GET / (plaintext) | 4 | 40,000 | ~13,194 req/s | 302μs | 219μs |
-| GET /json (JSON) | 4 | 40,000 | ~12,109 req/s | 330μs | 242μs |
-| GET /param/:id | 4 | 40,000 | ~12,053 req/s | 332μs | 242μs |
-| GET / (high concurrency) | 16 | 80,000 | ~13,931 req/s | 1.15ms | 253μs |
+| GET / (conn-per-req) | 4 | 40,000 | ~22,265 req/s | 177μs | 129μs |
+| GET /json (conn-per-req) | 4 | 40,000 | ~22,940 req/s | 174μs | 134μs |
 
-*Note: Throughput is limited by connection-per-request overhead (TCP handshake per request). With keep-alive connections and external tools like bombardier/wrk, throughput would be significantly higher.*
+*Keep-alive (connection reuse — amortized TCP handshake):*
+| Benchmark | Threads | Requests | Throughput | Avg Latency | Min Latency |
+|-----------|---------|----------|------------|-------------|-------------|
+| GET / (keep-alive) | 4 | 40,000 | ~144,680 req/s | 27μs | 19μs |
+| GET /json (keep-alive) | 4 | 40,000 | ~150,318 req/s | 26μs | 18μs |
+| GET /param/:id (keep-alive) | 4 | 40,000 | ~89,148 req/s | 45μs | 22μs |
+| GET / (keep-alive, 16t) | 16 | 80,000 | ~364,749 req/s | 42μs | 24μs |
+
+*Thread pool eliminated thread-spawn overhead: conn-per-req improved from ~13K to ~22K req/s (~73% faster). Keep-alive throughput unchanged at ~150K req/s.*
 
 **Build commands:**
 ```
@@ -224,6 +233,7 @@ zig build benchmark -Doptimize=ReleaseFast  # Run benchmarks
 **Files created:**
 - `src/integration_test.zig` — End-to-end HTTP integration tests
 - `src/benchmark.zig` — Built-in performance benchmark
+- `src/http/thread_pool.zig` — Fixed-size thread pool with bounded `Io.Queue` work queue
 
 ---
 

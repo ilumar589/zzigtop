@@ -5,6 +5,7 @@
 pub const Server = @import("server.zig");
 pub const Connection = @import("connection.zig");
 pub const Router = @import("router.zig");
+pub const ThreadPool = @import("thread_pool.zig");
 pub const Request = @import("request.zig");
 pub const Response = @import("response.zig");
 pub const parser = @import("parser.zig");
