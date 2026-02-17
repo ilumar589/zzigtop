@@ -23,7 +23,14 @@
 | 9 | Build integration & main entry point | ✅ COMPLETE |
 | 10 | Testing, benchmarking & tuning | ✅ COMPLETE |
 | 11a | Async I/O pool (Io.Group dispatch) | ✅ COMPLETE |
-| 11b | Structured concurrency (timeouts, graceful shutdown, parallel handlers) | 🔲 NOT STARTED |
+| 11b | Structured concurrency (Kotlin-style scoped lifetimes) | 🔲 NOT STARTED |
+| | 11b-1: Handler signature — pass `Io` to handlers | 🔲 |
+| | 11b-2: Connection scope — idle timeout via `io.select()` | 🔲 |
+| | 11b-3: Request timeout — `withTimeout` around handlers | 🔲 |
+| | 11b-4: Graceful shutdown — cancel/drain server scope | 🔲 |
+| | 11b-5: Handler concurrency — `io.async()` fan-out | 🔲 |
+| | 11b-6: Background tasks — metrics, health monitoring | 🔲 |
+| | 11b-7: Integration tests — verify SC guarantees | 🔲 |
 
 ---
 
@@ -286,158 +293,559 @@ Then read `docs/ARCHITECTURE.md` for the overall design, and the specific source
 
 ## Step 11b: Structured Concurrency (NOT STARTED)
 
-### Goal
+### Vision
 
-Evolve from "fire-and-forget `Group.async()`" to a **structured concurrency** model where:
-- Every async task has a well-defined lifetime scope
-- Cancellation propagates cleanly from parent → children
-- Timeouts are first-class and composable
-- Handlers can spawn parallel sub-tasks safely
-- Graceful shutdown drains in-flight work
+Redesign the entire server around **structured concurrency**, inspired by
+[Kotlin coroutines](https://kotlinlang.org/docs/coroutines-basics.html) and
+[JEP 453 (Java)](https://openjdk.org/jeps/453). The key principle:
+
+> **Every concurrent operation has a well-defined scope.
+> When the scope ends, all child operations are guaranteed to be complete (or canceled).**
+
+This replaces "fire-and-forget" with a hierarchy where:
+- The _server scope_ owns all _connection scopes_
+- Each _connection scope_ owns its _request scopes_
+- Each _request scope_ owns any _handler sub-tasks_
+- Cancellation flows top-down; completion flows bottom-up
+
+### Kotlin ↔ Zig Mapping
+
+| Kotlin Concept | Zig `std.Io` Equivalent | Notes |
+|----------------|------------------------|-------|
+| `CoroutineScope { }` | `Io.Group` + `defer group.cancel(io)` | Group = scope boundary; defer = automatic cleanup |
+| `launch { }` | `group.async(io, fn, args)` | Fire-and-forget child task (returns `Cancelable!void`) |
+| `async { } / .await()` | `io.async(fn, args)` → `future.await(io)` | Result-bearing child task |
+| `withTimeout(ms) { }` | `io.select(.{ .result = &op, .timeout = &sleep })` | Race operation against deadline |
+| `coroutineScope { }` | Nested `Io.Group { defer cancel; ...; await; }` | Suspends parent until all children complete |
+| `supervisorScope { }` | Separate Group per child (isolate failures) | Child errors don't cancel siblings |
+| `Dispatchers.IO / Default` | Io runtime (Evented/Threaded backend) | Automatic — no manual dispatcher selection |
+| `Job.cancel()` | `future.cancel(io)` / `group.cancel(io)` | Cooperative cancellation |
+| `isActive / ensureActive()` | `io.checkCancel()` | Manual cancellation checkpoint |
+| `NonCancellable` | `io.swapCancelProtection(.blocked)` | Critical sections immune to cancel |
+| `yield()` | `io.checkCancel()` (closest equivalent) | Cancellation point in CPU-bound loops |
+| `Channel<T>` | `Io.Queue(T)` | Bounded MPMC with backpressure |
+| `select { }` | `io.select(.{...})` / `Io.Select(U)` | First-ready wins |
+| `Flow<T>` | No direct equivalent | Could build with `Queue` + producer task |
+
+### Scope Hierarchy
+
+```
+Server Scope (Io.Group — lifetime: entire server process)
+│
+├── Accept Loop Task (runs until shutdown / cancel)
+│
+├── Background Tasks (metrics reporter, health checker, etc.)
+│
+├── Connection Scope 1 (Io.Group — lifetime: one TCP connection)
+│   ├── Idle Timeout Task (io.sleep → cancel connection if idle)
+│   │
+│   ├── Request Scope 1.1 (lifetime: one HTTP request)
+│   │   ├── Handler execution (with request timeout)
+│   │   ├── Handler Sub-Task A (io.async → fan-out)
+│   │   └── Handler Sub-Task B (io.async → fan-out)
+│   │
+│   ├── Request Scope 1.2 (keep-alive, next request)
+│   │   └── Handler execution
+│   │
+│   └── (connection close or idle timeout)
+│
+├── Connection Scope 2 ...
+├── Connection Scope 3 ...
+└── (shutdown → group.cancel → cascades to all)
+```
+
+### Cancellation Flow
+
+```
+                Shutdown signal
+                     │
+              ┌──────▼──────┐
+              │ Server Scope │ ── group.cancel(io)
+              │  (Io.Group)  │
+              └──────┬───────┘
+                     │ error.Canceled propagates to every child
+         ┌───────────┼───────────┐
+         ▼           ▼           ▼
+   ┌───────────┐ ┌────────┐ ┌────────┐
+   │ Accept    │ │ Conn 1 │ │ Conn 2 │
+   │ (breaks)  │ │        │ │        │
+   └───────────┘ └───┬────┘ └───┬────┘
+                     │           │
+              CancelProtection   │
+              around flush()     │
+                     │     ┌─────┴─────┐
+              finishes     │ Handler   │ ← gets error.Canceled
+              response     │ sub-tasks │   at next Io call
+                     │     └───────────┘
+              closes stream
+```
 
 ### Available Io Primitives
 
 | Primitive | Purpose | Error Model |
 |-----------|---------|-------------|
-| `Io.Group` | Unordered task set, cancel/await all | Tasks return `Cancelable!void` only |
-| `Io.Select(U)` | Spawn N tasks, collect results via union | Full result types via union variants |
+| `Io.Group` | Scope boundary — cancel/await all children | Tasks must return `Cancelable!void` |
+| `Io.Select(U)` | Spawn N tasks, collect results via tagged union | Full result types preserved |
 | `io.select(.{...})` | Race N futures, first wins | Returns winning future's result |
-| `io.async(fn, args)` → `Future(T)` | Single async task | Full result type preserved |
-| `io.sleep(duration, clock)` | Cancelable sleep | Returns `Cancelable!void` |
-| `Clock.Timestamp.wait(ts, io)` | Sleep until deadline | Returns `Cancelable!void` |
-| `CancelProtection` | Block cancel in critical sections | `io.swapCancelProtection(.blocked)` |
-| `io.recancel()` | Re-arm cancel signal | For partial-work-then-propagate |
-| `io.checkCancel()` | Manual cancel point | For CPU-bound loops |
-| `Io.Queue(T)` | Bounded MPMC channel | Closed + Canceled errors |
+| `io.async(fn, args)` → `Future(T)` | Single result-bearing child task | Full result type preserved |
+| `io.concurrent(fn, args)` → `Future(T)` | Like async but **guaranteed** separate thread | Can fail: `ConcurrencyUnavailable` |
+| `io.sleep(duration, clock)` | Cancelable timer | `Cancelable!void` |
+| `Clock.Timestamp.wait(ts, io)` | Sleep until absolute deadline | `Cancelable!void` |
+| `io.swapCancelProtection(.blocked)` | Critical section (NonCancellable) | Blocks `error.Canceled` delivery |
+| `io.recancel()` | Re-arm cancel after partial handling | Deferred propagation |
+| `io.checkCancel()` | Manual cancel checkpoint | For CPU-bound loops |
+| `Io.Queue(T)` | Bounded MPMC channel (like Kotlin Channel) | `Closed + Canceled` errors |
 
-### Planned Sub-Steps
+### Implementation Plan — 7 Sub-Steps
 
-#### 11b-1: Connection Timeouts
+The steps build on each other. Each is independently testable/committable.
 
-**Add idle timeout and header-read timeout per connection.**
+```
+11b-1  Handler Signature      ← pass Io to handlers (foundation for everything)
+  ↓
+11b-2  Connection Scope       ← Io.Group per connection, idle timeout
+  ↓
+11b-3  Request Timeout        ← withTimeout pattern around handler calls
+  ↓
+11b-4  Graceful Shutdown      ← server scope cancel → drain connections
+  ↓
+11b-5  Handler Concurrency    ← handlers use io.async() for fan-out
+  ↓
+11b-6  Background Tasks       ← metrics, health monitoring in server scope
+  ↓
+11b-7  Integration Tests      ← test timeout, shutdown, concurrency behavior
+```
 
-Use `io.select()` to race the HTTP read against a sleep:
+---
+
+#### 11b-1: Handler Signature Change (Foundation)
+
+**Why first:** Every subsequent step needs `Io` inside handlers or connection logic.
+In Kotlin, every coroutine function has access to the `CoroutineScope`. Here, `Io`
+is the equivalent — it's the handle to the async runtime.
+
+**Change `HandlerFn` signature:**
 ```zig
-// Race header read against timeout
-var read_future = io.async(receiveHead, .{&http_server});
-var timeout_future = io.async(Io.sleep, .{io, Duration.fromSeconds(30), .awake});
-switch (try io.select(.{ .request = &read_future, .timeout = &timeout_future })) {
-    .request => |head| { /* process */ },
-    .timeout => { /* close connection, send 408 */ },
+// Before:
+pub const HandlerFn = *const fn (*Request, *Response) anyerror!void;
+
+// After:
+pub const HandlerFn = *const fn (*Request, *Response, Io) anyerror!void;
+```
+
+**Files to modify:**
+| File | Change |
+|------|--------|
+| `router.zig` | `HandlerFn` type adds `Io` parameter |
+| `connection.zig` | Pass `io` when calling `match.handler(&request, &response, io)` |
+| `http_server_main.zig` | All 4 handlers gain `io: Io` (use `_ = io;` for now) |
+| `request.zig` | Optionally store `io` in Request for convenience |
+| `integration_test.zig` | Update test handler signatures |
+| `benchmark.zig` | Update benchmark handler signatures |
+
+**Deliverable:** All handlers receive `Io`, enabling structured concurrency in later steps.
+
+---
+
+#### 11b-2: Connection Scope with Idle Timeout
+
+**Model: `coroutineScope { }` per connection with a `withTimeout` on idle reads.**
+
+Each connection becomes its own scope. Inside that scope, an idle-timeout task
+races against the `receiveHead()` call:
+
+```zig
+// Kotlin equivalent:
+// coroutineScope {
+//     withTimeout(30.seconds) {
+//         val request = receiveHead()
+//     }
+// }
+
+// Zig equivalent:
+pub fn handleAsync(stream: Io.net.Stream, io: Io, ...) Io.Cancelable!void {
+    defer stream.close(io);
+
+    var arena_state: std.heap.ArenaAllocator = .init(allocator);
+    defer arena_state.deinit();
+
+    // Connection scope — all request processing happens here
+    handleRequests(&arena_state, stream, io, router);
+}
+
+fn handleRequests(arena_state: ..., stream: ..., io: Io, router: ...) void {
+    var read_buffer: [8192]u8 = undefined;
+    var write_buffer: [8192]u8 = undefined;
+    var stream_reader = stream.reader(io, &read_buffer);
+    var stream_writer = stream.writer(io, &write_buffer);
+    var http_server = http.Server.init(&stream_reader.interface, &stream_writer.interface);
+
+    while (true) {
+        // withTimeout(idle_timeout) { receiveHead() }
+        var read_future  = io.async(receiveHeadWrapper, .{&http_server});
+        var sleep_future = io.async(sleepFn, .{ io, idle_timeout });
+
+        const head = switch (io.select(.{ .request = &read_future, .timeout = &sleep_future })) {
+            .request => |result| result catch break,  // parse error → close
+            .timeout => break,                         // idle timeout → close
+        } catch break;  // canceled
+
+        sleep_future.cancel(io);  // cancel whichever didn't fire
+
+        // ... handle request ...
+    }
 }
 ```
 
-**Files to modify:** `connection.zig` — wrap the `receiveHead()` call
-**Deliverable:** Connections that sit idle > N seconds get closed with 408 Request Timeout
-
-#### 11b-2: Request-Level Timeouts
-
-**Enforce a max duration for handler execution.**
-
-Wrap each handler call in a `select` against a deadline:
+**Config additions to `Server.Config`:**
 ```zig
-var handler_future = io.async(match.handler, .{&request, &response});
-var deadline = io.async(Io.sleep, .{io, Duration.fromSeconds(10), .awake});
-switch (try io.select(.{ .ok = &handler_future, .timeout = &deadline })) {
-    .ok => {},
-    .timeout => { handler_future.cancel(io); send503(); },
+/// Idle timeout between requests on a keep-alive connection (seconds).
+/// 0 = no timeout. Default: 30s.
+idle_timeout_s: u32 = 30,
+```
+
+**Files to modify:**
+| File | Change |
+|------|--------|
+| `connection.zig` | Wrap `receiveHead()` in `io.select()` vs `io.sleep()` |
+| `server.zig` | Add `idle_timeout_s` to Config, pass to connection |
+
+**Deliverable:** Idle connections auto-close after 30s. Freed resources for other connections.
+
+---
+
+#### 11b-3: Request-Level Timeout
+
+**Model: `withTimeout(10.seconds) { handler(request, response) }`**
+
+Wrap each handler invocation in a select against a deadline. If the handler
+takes too long, cancel it and send 503:
+
+```zig
+// Kotlin:  withTimeout(10.seconds) { handler(req, res) }
+
+// Zig:
+var handler_future = io.async(match.handler, .{ &request, &response, io });
+var deadline_future = io.async(sleepFn, .{ io, request_timeout });
+
+switch (io.select(.{ .ok = &handler_future, .timeout = &deadline_future })) {
+    .ok => |result| {
+        deadline_future.cancel(io);
+        result catch { sendInternalError(&http_request) catch {}; };
+    },
+    .timeout => {
+        handler_future.cancel(io);
+        // CancelProtection around error response — don't let shutdown
+        // interrupt our 503 write
+        const old = io.swapCancelProtection(.blocked);
+        defer _ = io.swapCancelProtection(old);
+        send503(&stream_writer.interface) catch {};
+    },
 }
 ```
 
-**Files to modify:** `connection.zig` — wrap handler dispatch
-**Deliverable:** Handlers that exceed the timeout get canceled, client gets 503
+**Config additions:**
+```zig
+/// Maximum time for a handler to complete (seconds). 0 = no timeout.
+request_timeout_s: u32 = 10,
+```
 
-#### 11b-3: Graceful Shutdown
+**Files to modify:**
+| File | Change |
+|------|--------|
+| `connection.zig` | Wrap handler call in `io.select()` vs deadline |
+| `server.zig` | Add `request_timeout_s` to Config |
 
-**On shutdown signal, stop accepting new connections and drain in-flight work.**
+**Deliverable:** Slow handlers are canceled after N seconds; client gets 503.
 
-Architecture:
-1. Spawn the accept loop as an `io.async()` (so we get a `Future` we can cancel)
-2. Listen for a shutdown signal (platform-specific or via a sentinel)
-3. On signal: cancel the accept future → accept loop exits → `group.await()` drains in-flight connections
-4. Connections in keep-alive receive `error.Canceled` at their next I/O point and exit cleanly
+---
+
+#### 11b-4: Graceful Shutdown
+
+**Model: Kotlin's `scope.cancel()` + `scope.join()` pattern.**
+
+The server scope (`Io.Group`) owns all connections. On shutdown:
+1. Cancel the accept loop (it sees `error.Canceled` on `accept()`)
+2. In-flight connections receive cancel at their next Io call
+3. Connections use `CancelProtection` to finish writing the current response
+4. `group.await()` blocks until all connections have drained
 
 ```zig
-pub fn run(self: *Server, io: Io) void {
+// Server.run — now returns when shutdown is requested
+pub fn run(self: *Server, io: Io) Io.Cancelable!void {
     var group: Io.Group = .init;
-    defer group.cancel(io);        // step 3: cancels all connections
+    defer group.cancel(io);  // ensures cleanup on any exit
 
-    // Accept loop — exits when canceled
     while (true) {
         const stream = self.tcp_server.accept(io) catch |err| switch (err) {
-            error.Canceled => break,  // shutdown requested
-            // ...
+            error.Canceled => break,          // ← shutdown signal
+            error.ConnectionAborted => continue,
+            else => { log(err); continue; },
         };
-        group.async(io, Connection.handleAsync, .{stream, io, self.router, self.allocator});
+        group.async(io, Connection.handleAsync, .{ stream, io, ... });
     }
 
-    // Drain: wait for in-flight connections to finish
-    group.await(io) catch {};
+    // Drain: wait for all in-flight connections to finish
+    group.await(io) catch {};  // swallow Canceled from children
 }
 ```
 
-**Files to modify:** `server.zig`, `http_server_main.zig`
-**Deliverable:** Clean server shutdown with no abruptly killed connections
-
-#### 11b-4: Parallel Handler Sub-Tasks
-
-**Allow request handlers to spawn sub-tasks via `Io.Group` or `io.async()`.**
-
-Pass `Io` to handlers so they can do concurrent work:
+**Connection cancel-safety:**
 ```zig
-fn handleDashboard(request: *http.Request, response: *http.Response, io: Io) anyerror!void {
-    // Fan-out: fetch user profile and notifications concurrently
-    var profile_future = io.async(fetchProfile, .{request.pathParam("id").?, io});
-    var notifs_future  = io.async(fetchNotifs, .{request.pathParam("id").?, io});
+fn handleInner(...) void {
+    while (true) {
+        var http_request = http_server.receiveHead() catch |err| switch (err) {
+            error.Canceled => break,  // shutdown → exit keep-alive loop
+            // ...
+        };
 
+        // ... route + call handler ...
+
+        // CancelProtection: finish writing response even during shutdown
+        {
+            const old = io.swapCancelProtection(.blocked);
+            defer _ = io.swapCancelProtection(old);
+            response.flush() catch {};
+        }
+    }
+}
+```
+
+**Shutdown trigger options:**
+| Approach | Mechanism | Platform |
+|----------|-----------|----------|
+| External cancel | Caller cancels the `Future` returned by `io.async(server.run, ...)` | All |
+| Sentinel event | `Io.Event` set by signal handler thread | All |
+| Signal FD | `posix.signalfd` → readable when SIGTERM received | Linux |
+| Ctrl+C handler | Background thread with `SetConsoleCtrlHandler` | Windows |
+
+**Files to modify:**
+| File | Change |
+|------|--------|
+| `server.zig` | `run()` returns `Io.Cancelable!void`, handle `error.Canceled` in accept |
+| `connection.zig` | `CancelProtection` around response flush; handle `Canceled` in read loop |
+| `http_server_main.zig` | Spawn `server.run` as `io.async()`, set up shutdown trigger |
+
+**Deliverable:** `Ctrl+C` or external signal drains in-flight requests cleanly.
+
+---
+
+#### 11b-5: Handler Concurrency (Fan-Out / Fan-In)
+
+**Model: Kotlin `coroutineScope { async { } + async { } }` inside a handler.**
+
+Handlers can spawn concurrent sub-tasks bounded by the request's lifetime.
+When the handler returns (or is canceled), all sub-tasks are guaranteed complete:
+
+```zig
+// Kotlin:
+// suspend fun handleDashboard(req: Request): Response {
+//     coroutineScope {
+//         val profile = async { fetchProfile(req.userId) }
+//         val notifs  = async { fetchNotifications(req.userId) }
+//         render(profile.await(), notifs.await())
+//     }
+// }
+
+// Zig:
+fn handleDashboard(request: *Request, response: *Response, io: Io) anyerror!void {
+    const user_id = request.pathParam("id") orelse return error.BadRequest;
+
+    // Fan-out: two concurrent fetches
+    var profile_future = io.async(fetchProfile, .{ user_id, io, request.arena });
+    var notifs_future  = io.async(fetchNotifications, .{ user_id, io, request.arena });
+
+    // Fan-in: await both (order doesn't matter, both run concurrently)
     const profile = profile_future.await(io);
     const notifs  = notifs_future.await(io);
 
-    const body = try renderDashboard(request.arena, profile, notifs);
+    // Combine results
+    const body = try std.fmt.allocPrint(
+        request.arena,
+        "Profile: {s}\nNotifications: {d}\n",
+        .{ profile.name, notifs.count },
+    );
     try response.sendText(.ok, body);
 }
 ```
 
-**Files to modify:**
-- `router.zig` — handler signature gains `io: Io` parameter
-- `connection.zig` — pass `io` to handler calls
-- `http_server_main.zig` — update handler signatures
-- All existing handlers — add `io: Io` param (can `_ = io;` if unused)
+**For fire-and-forget sub-tasks** (logging, analytics), use a request-scoped Group:
 
-**Deliverable:** Handlers can do parallel I/O; example `/dashboard` route with fan-out
-
-#### 11b-5: Health & Metrics Monitoring
-
-**Spawn a concurrent monitoring task alongside the accept loop.**
-
-Use `Group` or `Select` to run a periodic stats reporter:
 ```zig
-group.async(io, reportMetrics, .{io, &stats});  // periodic: active conns, req/s, etc.
+fn handleOrder(request: *Request, response: *Response, io: Io) anyerror!void {
+    var tasks: Io.Group = .init;
+    defer tasks.cancel(io);  // ← structured: all children done when handler returns
+
+    // Fire-and-forget: send analytics event
+    tasks.async(io, sendAnalyticsEvent, .{ "order_placed", request.path, io });
+
+    // Main work
+    const order = try processOrder(request, io);
+    try response.sendJson(.ok, order);
+
+    // Await fire-and-forget tasks before returning
+    tasks.await(io) catch {};
+}
 ```
 
-Track: active connections (atomic counter), total requests served, uptime.
+**Files to modify:**
+| File | Change |
+|------|--------|
+| `http_server_main.zig` | Add example `/dashboard` route with fan-out |
+| (no framework changes needed) | Handlers already receive `Io` from 11b-1 |
 
-**Files to modify:** `server.zig` — add metrics struct, `connection.zig` — inc/dec counters
-**Deliverable:** Periodic log output with server metrics; `/metrics` endpoint
+**Deliverable:** Example handler demonstrating concurrent sub-tasks with structured lifetime.
 
-### Implementation Order
+---
+
+#### 11b-6: Background Tasks & Metrics
+
+**Model: Kotlin's long-lived `launch { }` inside a scope.**
+
+Background tasks (metrics collection, periodic cleanup) run as children of the
+server scope. They're automatically canceled on shutdown:
+
+```zig
+pub fn run(self: *Server, io: Io) Io.Cancelable!void {
+    var group: Io.Group = .init;
+    defer group.cancel(io);
+
+    // Background task: periodic metrics reporter
+    group.async(io, metricsReporter, .{ io, &self.stats });
+
+    // Accept loop
+    while (true) {
+        const stream = self.tcp_server.accept(io) catch |err| switch (err) {
+            error.Canceled => break,
+            // ...
+        };
+        // Increment active connections
+        _ = self.stats.active_connections.fetchAdd(1, .monotonic);
+        group.async(io, Connection.handleAsync, .{ stream, io, ..., &self.stats });
+    }
+
+    group.await(io) catch {};
+}
+
+fn metricsReporter(io: Io, stats: *Stats) Io.Cancelable!void {
+    while (true) {
+        try io.sleep(Duration.fromSeconds(10), .awake);  // yields Canceled on shutdown
+        const active = stats.active_connections.load(.monotonic);
+        const total = stats.total_requests.load(.monotonic);
+        std.debug.print("[metrics] active={d} total={d}\n", .{ active, total });
+    }
+}
+```
+
+**Stats struct (atomic for cross-fiber/thread safety):**
+```zig
+pub const Stats = struct {
+    active_connections: std.atomic.Value(u64) = .init(0),
+    total_requests: std.atomic.Value(u64) = .init(0),
+    start_time: Io.Timestamp = undefined,
+};
+```
+
+**Optional: `/metrics` endpoint** returning JSON stats (uses handler `Io` from 11b-1).
+
+**Files to modify:**
+| File | Change |
+|------|--------|
+| `server.zig` | Add `Stats` struct, spawn metrics reporter in server scope |
+| `connection.zig` | Increment/decrement active connections, count requests |
+| `http_server_main.zig` | Optional `/metrics` route |
+
+**Deliverable:** Real-time server metrics logged every 10s; `/metrics` JSON endpoint.
+
+---
+
+#### 11b-7: Structured Concurrency Integration Tests
+
+**Add tests that verify the structured concurrency guarantees:**
+
+| Test | What it verifies |
+|------|-----------------|
+| Idle timeout fires | Connection closed after N seconds of inactivity |
+| Idle timeout doesn't fire | Active connection stays open past timeout window |
+| Request timeout fires | Slow handler returns 503 |
+| Graceful shutdown drains | In-flight request completes before server exits |
+| Cancel propagation | Server cancel → connection cancel → handler cancel chain |
+| Handler fan-out | Concurrent sub-tasks complete before response |
+| Handler fan-out cancel | Sub-tasks canceled when handler times out |
+| Metrics counting | Active connections counter is accurate |
+
+**Files to create/modify:**
+| File | Change |
+|------|--------|
+| `integration_test.zig` | Add 8+ new structured concurrency tests |
+| `benchmark.zig` | Optional: timeout-aware benchmarks |
+
+**Deliverable:** Comprehensive test suite proving structured concurrency invariants.
+
+---
+
+### Architecture After Step 11b (Target State)
 
 ```
-11b-1  Connection Timeouts    ← simplest select() usage, immediate value
-  ↓
-11b-2  Request Timeouts       ← builds on same pattern, cancel handler
-  ↓
-11b-3  Graceful Shutdown      ← requires accept loop restructure
-  ↓
-11b-4  Parallel Handlers      ← handler signature change (breaking), most impactful
-  ↓
-11b-5  Health & Metrics       ← polish, adds observability
+┌──────────────────── Server Scope (Io.Group) ────────────────────┐
+│                                                                  │
+│  ┌─────────────┐  ┌──────────────┐                              │
+│  │ Accept Loop │  │ Metrics Task │  (background, periodic)      │
+│  │ (cancelable)│  │  (cancelable)│                              │
+│  └──────┬──────┘  └──────────────┘                              │
+│         │                                                        │
+│    accept()                                                      │
+│         │                                                        │
+│  ┌──────▼──── Connection Scope (per-conn lifetime) ──────────┐  │
+│  │                                                            │  │
+│  │  ┌─────────────────┐                                      │  │
+│  │  │ Idle Timeout     │  io.select(read vs sleep)           │  │
+│  │  │ (30s default)    │                                      │  │
+│  │  └─────────────────┘                                      │  │
+│  │                                                            │  │
+│  │  ┌──── Request Scope (per-request lifetime) ──────────┐   │  │
+│  │  │                                                     │   │  │
+│  │  │  ┌──────────────┐  io.select(handler vs deadline)  │   │  │
+│  │  │  │ Req Timeout  │  (10s default)                   │   │  │
+│  │  │  └──────────────┘                                  │   │  │
+│  │  │                                                     │   │  │
+│  │  │  Handler(request, response, io)                    │   │  │
+│  │  │  ├── io.async(subTaskA)  ← fan-out                 │   │  │
+│  │  │  ├── io.async(subTaskB)  ← fan-out                 │   │  │
+│  │  │  └── future.await()      ← fan-in                  │   │  │
+│  │  │                                                     │   │  │
+│  │  │  CancelProtection { response.flush() }             │   │  │
+│  │  │                                                     │   │  │
+│  │  └─── arena.reset(.retain_capacity) ──────────────────┘   │  │
+│  │                                                            │  │
+│  │  (keep-alive → next Request Scope)                        │  │
+│  │                                                            │  │
+│  └─── stream.close() ── arena.deinit() ──────────────────────┘  │
+│                                                                  │
+│  (shutdown → group.cancel() → cascades to all)                  │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
-### Key Design Constraints
+### Key Design Principles
 
-1. **Group tasks return `Cancelable!void` only** — no custom error propagation. Use `Select(U)` or `Future(T)` when you need result types.
-2. **`handleAsync` must propagate `error.Canceled`** — if any Io op returns `Canceled`, the function must also return it (assertion-enforced).
-3. **CancelProtection** needed around response flush — don't cancel mid-write (partial HTTP response = protocol violation).
-4. **No signal handling in std.Io** — graceful shutdown needs either a sentinel mechanism or platform-specific signal code.
-5. **Arenas are per-connection, not per-thread** — fibers migrate between OS threads, so thread-local state is unsound.
+1. **Scoped lifetime = `defer group.cancel(io)`** — every Group is created with
+   a defer that ensures all children are cleaned up, even on early return or error.
+   This is the Zig equivalent of Kotlin's `coroutineScope { }`.
+
+2. **No orphaned tasks** — unlike `go func()` in Go, every async task is a child
+   of a Group or tracked as a Future. Nothing escapes its scope.
+
+3. **Cancel propagation is cooperative** — tasks receive `error.Canceled` at their
+   next Io operation. They must propagate it (enforced by assertion). This matches
+   Kotlin's cooperative cancellation via `isActive/ensureActive()`.
+
+4. **CancelProtection for critical sections** — response writes must complete
+   atomically (partial HTTP responses corrupt the protocol). Wrap them in
+   `io.swapCancelProtection(.blocked)`, equivalent to Kotlin's `withContext(NonCancellable)`.
+
+5. **Timeouts via racing** — `io.select(.{op, sleep})` is the universal timeout
+   pattern, equivalent to Kotlin's `withTimeout()`. No special timeout API needed.
+
+6. **Arenas are per-connection, not per-thread** — fibers migrate between OS threads
+   in the Evented backend. Thread-local state is unsound. Arenas travel with the
+   fiber/task stack.
