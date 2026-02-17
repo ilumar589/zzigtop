@@ -3,8 +3,16 @@
 //! Manages the lifecycle of a single TCP connection:
 //! - Buffered I/O with stack-allocated buffers
 //! - HTTP/1.1 keep-alive loop (multiple requests per connection)
-//! - Thread-local arena reset between requests (O(1) via retain_capacity)
+//! - Per-connection arena reset between requests (O(1) via retain_capacity)
 //! - Delegates to std.http.Server for protocol parsing
+//! - Async-compatible: works with Io.Group for work-stealing dispatch
+//!
+//! Architecture:
+//!   Each accepted connection is spawned as an async task via Io.Group.
+//!   On the Evented backend (Linux io_uring / macOS kqueue), this runs as
+//!   a stackful fiber with automatic work-stealing between OS threads.
+//!   On the Threaded backend (Windows / fallback), it runs on a dynamically
+//!   managed pooled thread (lazy spawn, up to CPU_COUNT-1 threads).
 
 const std = @import("std");
 const http = std.http;
@@ -25,21 +33,57 @@ pub const Config = struct {
     write_buffer_size: usize = 8192,
 };
 
-/// Handle a single connection's lifetime.
+/// Handle a connection as an async task (compatible with Io.Group).
 ///
-/// This function:
+/// This is the entry point for the async dispatch model. Each accepted
+/// connection is spawned as a task via `group.async(io, handleAsync, .{...})`.
+///
+/// Creates a per-connection arena (fiber-safe — no thread-local state).
+/// On evented backends, fibers may migrate between OS threads via
+/// work-stealing, so thread-local arenas would be unsound.
+/// The arena is reset with `.retain_capacity` between requests for
+/// O(1) memory reuse without syscalls.
+///
+/// The `Io.Cancelable!void` return type allows the Io.Group to request
+/// cancellation during graceful shutdown.
+pub fn handleAsync(
+    stream: Io.net.Stream,
+    io: Io,
+    router: *const Router,
+    allocator: std.mem.Allocator,
+) Io.Cancelable!void {
+    defer stream.close(io);
+
+    var arena_state: std.heap.ArenaAllocator = .init(allocator);
+    defer arena_state.deinit();
+
+    handleInner(&arena_state, stream, io, router);
+}
+
+/// Synchronous entry point — for direct use without Io.Group.
+///
+/// Takes a pre-existing arena (caller-owned) and handles the
+/// connection lifecycle. Used by the legacy thread pool path.
+pub fn handle(
+    arena_state: *std.heap.ArenaAllocator,
+    stream: Io.net.Stream,
+    io: Io,
+    router: *const Router,
+) void {
+    defer stream.close(io);
+    handleInner(arena_state, stream, io, router);
+}
+
+/// Core keep-alive loop (shared by async and sync entry points).
+///
 /// 1. Creates buffered reader/writer over the TCP stream
 /// 2. Initializes std.http.Server for protocol parsing
 /// 3. Loops over requests (keep-alive)
-/// 4. For each request: resets thread arena, routes to handler, sends response
-/// 5. Cleans up when connection closes
-///
-/// The arena is owned by the worker thread and reset between requests
-/// with `.retain_capacity` — an O(1) operation that reuses existing
-/// memory without touching the backing allocator.
+/// 4. For each request: resets arena, routes to handler, sends response
+/// 5. Returns when connection closes or keep-alive ends
 ///
 /// All I/O buffers are stack-allocated for maximum performance.
-pub fn handle(
+fn handleInner(
     arena_state: *std.heap.ArenaAllocator,
     stream: Io.net.Stream,
     io: Io,
@@ -72,7 +116,7 @@ pub fn handle(
             break;
         };
 
-        // ---- Reset thread-local arena for this request ----
+        // ---- Reset per-connection arena for this request ----
         // retain_capacity keeps the underlying memory pages allocated,
         // just resets the bump pointer. Future allocations reuse the
         // same memory without any syscalls. Over time the arena converges
@@ -124,9 +168,6 @@ pub fn handle(
         // If client doesn't want keep-alive, we're done.
         if (!request.keep_alive) break;
     }
-
-    // Close the TCP stream.
-    stream.close(io);
 }
 
 /// Send a simple error response when we don't have a full HTTP request context.

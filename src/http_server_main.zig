@@ -22,42 +22,32 @@ pub fn main(init: std.process.Init) !void {
 
     // ---- Parse command line arguments ----
     var port: u16 = 8080;
-    var threads: u32 = 0; // 0 = auto-detect (CPU count)
     const args = try init.minimal.args.toSlice(arena);
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--port") and i + 1 < args.len) {
             port = std.fmt.parseInt(u16, args[i + 1], 10) catch 8080;
             i += 1;
-        } else if (std.mem.eql(u8, args[i], "--threads") and i + 1 < args.len) {
-            threads = std.fmt.parseInt(u32, args[i + 1], 10) catch 0;
-            i += 1;
         }
     }
 
     // ---- Start server ----
-    const effective_threads: u32 = if (threads > 0) threads else blk: {
-        const cpu_count = std.Thread.getCpuCount() catch 4;
-        break :blk @intCast(@max(cpu_count, 1));
-    };
-
     std.debug.print(
         \\
         \\  +--------------------------------------------+
         \\  |   Zig HTTP/1 Server                        |
         \\  |   Listening on http://127.0.0.1:{d:<5}      |
-        \\  |   Thread pool: {d:<3} workers                 |
+        \\  |   Async I/O pool (auto-scaled)             |
         \\  |   Press Ctrl+C to stop                     |
         \\  +--------------------------------------------+
         \\
         \\
-    , .{ port, effective_threads });
+    , .{port});
 
     var server = try http.Server.start(init.gpa, io, .{
         .port = port,
         .router = &router,
         .reuse_address = true,
-        .thread_pool_size = threads,
     });
     defer server.deinit(io);
 

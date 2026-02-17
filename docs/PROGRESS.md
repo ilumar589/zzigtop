@@ -4,7 +4,7 @@
 
 > **Last Updated:** 2026-02-17  
 > **Zig Version:** 0.16.0-dev.2535+b5bd49460  
-> **Status:** STEP 10 COMPLETE — All tests passing (64 unit + 10 integration), thread pool + benchmarks done
+> **Status:** STEP 11 IN PROGRESS — Async I/O pool complete, structured concurrency next
 
 ---
 
@@ -22,6 +22,8 @@
 | 8 | Core server with thread-per-connection (`server.zig`) | ✅ COMPLETE |
 | 9 | Build integration & main entry point | ✅ COMPLETE |
 | 10 | Testing, benchmarking & tuning | ✅ COMPLETE |
+| 11a | Async I/O pool (Io.Group dispatch) | ✅ COMPLETE |
+| 11b | Structured concurrency (timeouts, graceful shutdown, parallel handlers) | 🔲 NOT STARTED |
 
 ---
 
@@ -245,3 +247,197 @@ If context is full or work is interrupted, read this file first to understand:
 3. What the next step requires
 
 Then read `docs/ARCHITECTURE.md` for the overall design, and the specific source files for the current step.
+
+---
+
+## Step 11a: Async I/O Pool — Io.Group Dispatch (COMPLETE)
+
+**What was done:**
+- **Replaced the custom `ThreadPool`** with Zig's built-in `Io.Group.async()` dispatch
+- Each accepted connection is spawned as an async task via `group.async(io, Connection.handleAsync, .{...})`
+- The Io runtime manages concurrency automatically:
+  - **Evented backend** (Linux io_uring / macOS kqueue): stackful fibers + work-stealing
+  - **Threaded backend** (Windows / fallback): dynamic thread pool (lazy spawn up to CPU_COUNT-1)
+- Arena allocation changed from per-thread to per-connection (fiber-safe — fibers may migrate between OS threads)
+- Removed `--threads` CLI flag (Io runtime auto-scales)
+- Removed `thread_pool_size` / `max_pending_connections` from `Server.Config`
+- Marked old `thread_pool.zig` as superseded (kept for reference)
+
+**Files modified:**
+- `src/http/connection.zig` — Added `handleAsync()` (returns `Io.Cancelable!void`), refactored core into `handleInner()`
+- `src/http/server.zig` — Replaced ThreadPool with `Io.Group`, simplified Config
+- `src/http/http.zig` — Removed ThreadPool export
+- `src/http_server_main.zig` — Removed `--threads` arg, updated banner
+- `src/http/thread_pool.zig` — Added "SUPERSEDED" header comment
+- `docs/ARCHITECTURE.md` — Updated diagrams and threading model
+
+**Performance impact (ReleaseFast, Windows — Threaded backend):**
+
+| Benchmark | Before (ThreadPool) | After (Io.Group) | Change |
+|-----------|---------------------|-------------------|--------|
+| GET / (conn-per-req) | ~22K req/s | ~23,693 req/s | +7% |
+| GET / (keep-alive, 4t) | ~142K req/s | ~156,142 req/s | +10% |
+| GET / (keep-alive, 16t) | ~373K req/s | ~430,359 req/s | +15% |
+| GET /param/:id (keep-alive) | ~133K req/s | ~152,355 req/s | +15% |
+
+**Key insight:** Zero code manages threads anymore. The Io runtime (same one backing `std.process.Init`) handles all scheduling. On Linux/macOS with the Evented backend, this gives real work-stealing with fibers — thousands of concurrent connections on a few OS threads.
+
+---
+
+## Step 11b: Structured Concurrency (NOT STARTED)
+
+### Goal
+
+Evolve from "fire-and-forget `Group.async()`" to a **structured concurrency** model where:
+- Every async task has a well-defined lifetime scope
+- Cancellation propagates cleanly from parent → children
+- Timeouts are first-class and composable
+- Handlers can spawn parallel sub-tasks safely
+- Graceful shutdown drains in-flight work
+
+### Available Io Primitives
+
+| Primitive | Purpose | Error Model |
+|-----------|---------|-------------|
+| `Io.Group` | Unordered task set, cancel/await all | Tasks return `Cancelable!void` only |
+| `Io.Select(U)` | Spawn N tasks, collect results via union | Full result types via union variants |
+| `io.select(.{...})` | Race N futures, first wins | Returns winning future's result |
+| `io.async(fn, args)` → `Future(T)` | Single async task | Full result type preserved |
+| `io.sleep(duration, clock)` | Cancelable sleep | Returns `Cancelable!void` |
+| `Clock.Timestamp.wait(ts, io)` | Sleep until deadline | Returns `Cancelable!void` |
+| `CancelProtection` | Block cancel in critical sections | `io.swapCancelProtection(.blocked)` |
+| `io.recancel()` | Re-arm cancel signal | For partial-work-then-propagate |
+| `io.checkCancel()` | Manual cancel point | For CPU-bound loops |
+| `Io.Queue(T)` | Bounded MPMC channel | Closed + Canceled errors |
+
+### Planned Sub-Steps
+
+#### 11b-1: Connection Timeouts
+
+**Add idle timeout and header-read timeout per connection.**
+
+Use `io.select()` to race the HTTP read against a sleep:
+```zig
+// Race header read against timeout
+var read_future = io.async(receiveHead, .{&http_server});
+var timeout_future = io.async(Io.sleep, .{io, Duration.fromSeconds(30), .awake});
+switch (try io.select(.{ .request = &read_future, .timeout = &timeout_future })) {
+    .request => |head| { /* process */ },
+    .timeout => { /* close connection, send 408 */ },
+}
+```
+
+**Files to modify:** `connection.zig` — wrap the `receiveHead()` call
+**Deliverable:** Connections that sit idle > N seconds get closed with 408 Request Timeout
+
+#### 11b-2: Request-Level Timeouts
+
+**Enforce a max duration for handler execution.**
+
+Wrap each handler call in a `select` against a deadline:
+```zig
+var handler_future = io.async(match.handler, .{&request, &response});
+var deadline = io.async(Io.sleep, .{io, Duration.fromSeconds(10), .awake});
+switch (try io.select(.{ .ok = &handler_future, .timeout = &deadline })) {
+    .ok => {},
+    .timeout => { handler_future.cancel(io); send503(); },
+}
+```
+
+**Files to modify:** `connection.zig` — wrap handler dispatch
+**Deliverable:** Handlers that exceed the timeout get canceled, client gets 503
+
+#### 11b-3: Graceful Shutdown
+
+**On shutdown signal, stop accepting new connections and drain in-flight work.**
+
+Architecture:
+1. Spawn the accept loop as an `io.async()` (so we get a `Future` we can cancel)
+2. Listen for a shutdown signal (platform-specific or via a sentinel)
+3. On signal: cancel the accept future → accept loop exits → `group.await()` drains in-flight connections
+4. Connections in keep-alive receive `error.Canceled` at their next I/O point and exit cleanly
+
+```zig
+pub fn run(self: *Server, io: Io) void {
+    var group: Io.Group = .init;
+    defer group.cancel(io);        // step 3: cancels all connections
+
+    // Accept loop — exits when canceled
+    while (true) {
+        const stream = self.tcp_server.accept(io) catch |err| switch (err) {
+            error.Canceled => break,  // shutdown requested
+            // ...
+        };
+        group.async(io, Connection.handleAsync, .{stream, io, self.router, self.allocator});
+    }
+
+    // Drain: wait for in-flight connections to finish
+    group.await(io) catch {};
+}
+```
+
+**Files to modify:** `server.zig`, `http_server_main.zig`
+**Deliverable:** Clean server shutdown with no abruptly killed connections
+
+#### 11b-4: Parallel Handler Sub-Tasks
+
+**Allow request handlers to spawn sub-tasks via `Io.Group` or `io.async()`.**
+
+Pass `Io` to handlers so they can do concurrent work:
+```zig
+fn handleDashboard(request: *http.Request, response: *http.Response, io: Io) anyerror!void {
+    // Fan-out: fetch user profile and notifications concurrently
+    var profile_future = io.async(fetchProfile, .{request.pathParam("id").?, io});
+    var notifs_future  = io.async(fetchNotifs, .{request.pathParam("id").?, io});
+
+    const profile = profile_future.await(io);
+    const notifs  = notifs_future.await(io);
+
+    const body = try renderDashboard(request.arena, profile, notifs);
+    try response.sendText(.ok, body);
+}
+```
+
+**Files to modify:**
+- `router.zig` — handler signature gains `io: Io` parameter
+- `connection.zig` — pass `io` to handler calls
+- `http_server_main.zig` — update handler signatures
+- All existing handlers — add `io: Io` param (can `_ = io;` if unused)
+
+**Deliverable:** Handlers can do parallel I/O; example `/dashboard` route with fan-out
+
+#### 11b-5: Health & Metrics Monitoring
+
+**Spawn a concurrent monitoring task alongside the accept loop.**
+
+Use `Group` or `Select` to run a periodic stats reporter:
+```zig
+group.async(io, reportMetrics, .{io, &stats});  // periodic: active conns, req/s, etc.
+```
+
+Track: active connections (atomic counter), total requests served, uptime.
+
+**Files to modify:** `server.zig` — add metrics struct, `connection.zig` — inc/dec counters
+**Deliverable:** Periodic log output with server metrics; `/metrics` endpoint
+
+### Implementation Order
+
+```
+11b-1  Connection Timeouts    ← simplest select() usage, immediate value
+  ↓
+11b-2  Request Timeouts       ← builds on same pattern, cancel handler
+  ↓
+11b-3  Graceful Shutdown      ← requires accept loop restructure
+  ↓
+11b-4  Parallel Handlers      ← handler signature change (breaking), most impactful
+  ↓
+11b-5  Health & Metrics       ← polish, adds observability
+```
+
+### Key Design Constraints
+
+1. **Group tasks return `Cancelable!void` only** — no custom error propagation. Use `Select(U)` or `Future(T)` when you need result types.
+2. **`handleAsync` must propagate `error.Canceled`** — if any Io op returns `Canceled`, the function must also return it (assertion-enforced).
+3. **CancelProtection** needed around response flush — don't cancel mid-write (partial HTTP response = protocol violation).
+4. **No signal handling in std.Io** — graceful shutdown needs either a sentinel mechanism or platform-specific signal code.
+5. **Arenas are per-connection, not per-thread** — fibers migrate between OS threads, so thread-local state is unsound.

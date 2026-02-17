@@ -1,3 +1,15 @@
+//! *** SUPERSEDED — kept for reference ***
+//!
+//! This fixed-size thread pool has been replaced by Io.Group async dispatch
+//! in server.zig. The new approach uses Zig's built-in Io runtime:
+//!   - Evented backend: stackful fibers + work-stealing
+//!   - Threaded backend: dynamic thread pool (lazy spawn)
+//!
+//! The code below is preserved as a reference for manual thread pool
+//! implementation using Io.Queue(T) and std.Thread.
+//!
+//! -----------------------------------------------------------------------
+//!
 //! Fixed-size thread pool for connection handling.
 //!
 //! Instead of spawning a new OS thread per connection (which is expensive
