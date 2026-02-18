@@ -7,13 +7,24 @@
 const std = @import("std");
 const http = std.http;
 const mem = std.mem;
+const Io = std.Io;
 const Request = @import("request.zig");
 const Response = @import("response.zig");
 
 const Router = @This();
 
-/// Handler function type — receives request and response.
-pub const HandlerFn = *const fn (*Request, *Response) anyerror!void;
+/// Handler function type — receives request, response, and Io handle.
+///
+/// The `Io` parameter gives handlers access to the async runtime,
+/// enabling structured concurrency patterns:
+///   - `io.async(fn, args)` for fan-out sub-tasks
+///   - `io.sleep(duration, clock)` for delays
+///   - `io.select(.{...})` for racing / timeouts
+///   - `io.checkCancel()` for cooperative cancellation
+///
+/// This is the Zig equivalent of Kotlin's `suspend fun` — every
+/// handler runs within a cancellation scope and can spawn children.
+pub const HandlerFn = *const fn (*Request, *Response, Io) anyerror!void;
 
 /// A single compiled route entry.
 pub const Route = struct {
@@ -168,8 +179,8 @@ fn matchPath(
 
 // ---- Tests ----
 
-fn dummyHandler(_: *Request, _: *Response) anyerror!void {}
-fn otherHandler(_: *Request, _: *Response) anyerror!void {}
+fn dummyHandler(_: *Request, _: *Response, _: Io) anyerror!void {}
+fn otherHandler(_: *Request, _: *Response, _: Io) anyerror!void {}
 
 // ---------------------------------------------------------------------------
 // compilePattern tests

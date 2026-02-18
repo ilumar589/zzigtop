@@ -4,6 +4,8 @@
 //! - Buffered I/O with stack-allocated buffers
 //! - HTTP/1.1 keep-alive loop (multiple requests per connection)
 //! - Per-connection arena reset between requests (O(1) via retain_capacity)
+//! - Idle timeout: io.select() races receiveHead vs sleep (Kotlin withTimeout)
+//! - Request timeout: io.select() races handler vs deadline
 //! - Delegates to std.http.Server for protocol parsing
 //! - Async-compatible: works with Io.Group for work-stealing dispatch
 //!
@@ -24,6 +26,7 @@ const Response = @import("response.zig");
 const Router = @import("router.zig");
 
 const Connection = @This();
+const Server = @import("server.zig");
 
 /// Connection configuration.
 pub const Config = struct {
@@ -51,13 +54,21 @@ pub fn handleAsync(
     io: Io,
     router: *const Router,
     allocator: std.mem.Allocator,
+    idle_timeout_s: u32,
+    request_timeout_s: u32,
+    stats: ?*Server.Stats,
 ) Io.Cancelable!void {
     defer stream.close(io);
+    // Track active connections.
+    if (stats) |s| _ = s.active_connections.fetchAdd(1, .monotonic);
+    defer if (stats) |s| {
+        _ = s.active_connections.fetchSub(1, .monotonic);
+    };
 
     var arena_state: std.heap.ArenaAllocator = .init(allocator);
     defer arena_state.deinit();
 
-    handleInner(&arena_state, stream, io, router);
+    handleInner(&arena_state, stream, io, router, idle_timeout_s, request_timeout_s, stats);
 }
 
 /// Synchronous entry point — for direct use without Io.Group.
@@ -69,9 +80,11 @@ pub fn handle(
     stream: Io.net.Stream,
     io: Io,
     router: *const Router,
+    idle_timeout_s: u32,
+    request_timeout_s: u32,
 ) void {
     defer stream.close(io);
-    handleInner(arena_state, stream, io, router);
+    handleInner(arena_state, stream, io, router, idle_timeout_s, request_timeout_s, null);
 }
 
 /// Core keep-alive loop (shared by async and sync entry points).
@@ -88,6 +101,9 @@ fn handleInner(
     stream: Io.net.Stream,
     io: Io,
     router: *const Router,
+    idle_timeout_s: u32,
+    request_timeout_s: u32,
+    stats: ?*Server.Stats,
 ) void {
     // Stack-allocated I/O buffers — no heap allocation for connection I/O.
     var read_buffer: [8192]u8 = undefined;
@@ -102,19 +118,17 @@ fn handleInner(
 
     // ---- Keep-alive request loop ----
     while (true) {
-        // Receive and parse the HTTP request head.
-        var http_request = http_server.receiveHead() catch |err| {
-            switch (err) {
-                error.HttpHeadersInvalid => {
-                    @branchHint(.unlikely);
-                    // Send 400 Bad Request
-                    sendErrorResponse(&stream_writer.interface, .bad_request, "Bad Request") catch {};
-                },
-                // Connection closed or read error — just exit the loop
-                else => {},
-            }
-            break;
-        };
+        // Receive and parse the HTTP request head, with idle timeout.
+        // Returns null on timeout, connection close, parse error, or cancel.
+        var http_request = receiveWithTimeout(
+            &http_server,
+            io,
+            idle_timeout_s,
+            &stream_writer.interface,
+        ) orelse break;
+
+        // Count this request in server stats.
+        if (stats) |s| _ = s.total_requests.fetchAdd(1, .monotonic);
 
         // ---- Reset per-connection arena for this request ----
         // retain_capacity keeps the underlying memory pages allocated,
@@ -144,16 +158,23 @@ fn handleInner(
                 request.version,
             );
 
-            // Call the handler.
-            match.handler(&request, &response) catch {
-                // Handler returned an error — send 500.
-                sendInternalError(&http_request) catch {};
-                if (!request.keep_alive) break;
-                continue;
-            };
-
-            // If handler didn't flush, flush now.
-            // (Handler may have already called response.flush() or sendText())
+            // Call the handler with optional request timeout.
+            switch (dispatchHandler(
+                match.handler,
+                &request,
+                &response,
+                &http_request,
+                io,
+                request_timeout_s,
+                &stream_writer.interface,
+            )) {
+                .ok => {},
+                .handler_error => {
+                    if (!request.keep_alive) break;
+                    continue;
+                },
+                .timeout, .canceled => break,
+            }
         } else {
             // No route matched — 404 Not Found.
             http_request.respond("Not Found", .{
@@ -194,4 +215,166 @@ fn sendInternalError(http_request: *http.Server.Request) !void {
             .{ .name = "content-type", .value = "text/plain; charset=utf-8" },
         },
     });
+}
+
+// ============================================================================
+// Structured concurrency helpers
+// ============================================================================
+
+/// Sleep for the given number of seconds — compatible with io.async().
+/// Used for both idle timeout (11b-2) and request timeout (11b-3).
+fn sleepSeconds(io: Io, timeout_s: u32) Io.Cancelable!void {
+    return io.sleep(Io.Duration.fromSeconds(@as(i64, timeout_s)), .awake);
+}
+
+/// Wrapper for http.Server.receiveHead() — compatible with io.async().
+/// Runs as a concurrent task that yields on I/O.
+fn receiveHeadAsync(server: *http.Server) http.Server.ReceiveHeadError!http.Server.Request {
+    return server.receiveHead();
+}
+
+/// Call a handler function pointer — compatible with io.async().
+/// Wraps the dynamic dispatch so it can be raced against a timeout.
+fn callHandlerWrapper(
+    handler: Router.HandlerFn,
+    request: *Request,
+    response: *Response,
+    io: Io,
+) anyerror!void {
+    return handler(request, response, io);
+}
+
+/// Result of handler dispatch (with optional timeout).
+const DispatchResult = enum {
+    /// Handler completed successfully.
+    ok,
+    /// Handler returned an error (500 already sent).
+    handler_error,
+    /// Handler timed out (503 already sent).
+    timeout,
+    /// Canceled by server shutdown.
+    canceled,
+};
+
+/// Call the matched handler with optional request timeout.
+///
+/// When `request_timeout_s > 0`, races the handler against a deadline
+/// using `io.select()` — the Zig equivalent of Kotlin's:
+///   `withTimeout(10.seconds) { handler(request, response) }`
+///
+/// On timeout: cancels the handler, sends 503 with CancelProtection
+/// (ensures the error response is written even during shutdown).
+fn dispatchHandler(
+    handler: Router.HandlerFn,
+    request: *Request,
+    response: *Response,
+    http_request: *http.Server.Request,
+    io: Io,
+    request_timeout_s: u32,
+    error_writer: *Io.Writer,
+) DispatchResult {
+    // Fast path: no timeout — direct call.
+    if (request_timeout_s == 0) {
+        handler(request, response, io) catch {
+            sendInternalError(http_request) catch {};
+            return .handler_error;
+        };
+        return .ok;
+    }
+
+    // Race handler against request timeout using io.select().
+    // Zig equivalent of Kotlin's: withTimeout(10.seconds) { handler(req, res) }
+    var handler_future = io.async(callHandlerWrapper, .{ handler, request, response, io });
+    var deadline_future = io.async(sleepSeconds, .{ io, request_timeout_s });
+
+    const selected = io.select(.{ .ok = &handler_future, .timeout = &deadline_future }) catch {
+        // error.Canceled — server shutdown in progress.
+        handler_future.cancel(io) catch {};
+        deadline_future.cancel(io) catch {};
+        return .canceled;
+    };
+
+    switch (selected) {
+        .ok => |result| {
+            // Handler completed before timeout — cancel the deadline.
+            deadline_future.cancel(io) catch {};
+            result catch {
+                sendInternalError(http_request) catch {};
+                return .handler_error;
+            };
+            return .ok;
+        },
+        .timeout => {
+            // Handler took too long — cancel it and send 503.
+            handler_future.cancel(io) catch {};
+            // CancelProtection: ensure the 503 response is written completely
+            // even if a server shutdown cancel arrives during the write.
+            // Equivalent to Kotlin's withContext(NonCancellable) { ... }
+            const old = io.swapCancelProtection(.blocked);
+            defer _ = io.swapCancelProtection(old);
+            sendErrorResponse(error_writer, .service_unavailable, "Request Timeout") catch {};
+            return .timeout;
+        },
+    }
+}
+
+/// Receive the next HTTP request head with optional idle timeout.
+///
+/// Uses `io.select()` to race `receiveHead()` against `io.sleep()`,
+/// equivalent to Kotlin's `withTimeout(30.seconds) { receiveHead() }`.
+///
+///   - On success: returns the parsed request.
+///   - On idle timeout: returns null (connection was idle too long).
+///   - On parse error: sends 400, returns null.
+///   - On connection close: returns null.
+///   - On cancel (shutdown): returns null.
+fn receiveWithTimeout(
+    http_server: *http.Server,
+    io: Io,
+    idle_timeout_s: u32,
+    error_writer: *Io.Writer,
+) ?http.Server.Request {
+    // Fast path: no timeout configured — direct call.
+    if (idle_timeout_s == 0) {
+        return http_server.receiveHead() catch |err| {
+            if (err == error.HttpHeadersInvalid) {
+                @branchHint(.unlikely);
+                sendErrorResponse(error_writer, .bad_request, "Bad Request") catch {};
+            }
+            return null;
+        };
+    }
+
+    // Race receiveHead() against idle timeout using io.select().
+    // This is the Zig equivalent of Kotlin's:
+    //   withTimeout(30.seconds) { receiveHead() }
+    var read_future = io.async(receiveHeadAsync, .{http_server});
+    var sleep_future = io.async(sleepSeconds, .{ io, idle_timeout_s });
+
+    const selected = io.select(.{ .request = &read_future, .timeout = &sleep_future }) catch {
+        // error.Canceled — server shutdown in progress.
+        // Cancel both futures and wait for them to complete.
+        if (read_future.cancel(io)) |_| {} else |_| {}
+        sleep_future.cancel(io) catch {};
+        return null;
+    };
+
+    switch (selected) {
+        .request => |result| {
+            // Request arrived before timeout — cancel the idle timer.
+            sleep_future.cancel(io) catch {};
+            return result catch |err| {
+                if (err == error.HttpHeadersInvalid) {
+                    @branchHint(.unlikely);
+                    sendErrorResponse(error_writer, .bad_request, "Bad Request") catch {};
+                }
+                return null;
+            };
+        },
+        .timeout => {
+            // Idle timeout fired — cancel the pending read and close.
+            if (read_future.cancel(io)) |_| {} else |_| {}
+            return null;
+        },
+    }
 }

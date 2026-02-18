@@ -21,15 +21,15 @@ const bench_port: u16 = 18_090;
 // Handlers (minimal — we're measuring server overhead, not handler logic)
 // ============================================================================
 
-fn handlePlain(_: *http.Request, response: *http.Response) anyerror!void {
+fn handlePlain(_: *http.Request, response: *http.Response, _: std.Io) anyerror!void {
     try response.sendText(.ok, "OK");
 }
 
-fn handleJson(_: *http.Request, response: *http.Response) anyerror!void {
+fn handleJson(_: *http.Request, response: *http.Response, _: std.Io) anyerror!void {
     try response.sendJson(.ok, "{\"status\":\"ok\"}");
 }
 
-fn handleParam(request: *http.Request, response: *http.Response) anyerror!void {
+fn handleParam(request: *http.Request, response: *http.Response, _: std.Io) anyerror!void {
     const id = request.pathParam("id") orelse "0";
     const body = try std.fmt.allocPrint(request.arena, "id={s}", .{id});
     try response.sendText(.ok, body);
@@ -334,12 +334,13 @@ pub fn main(init: std.process.Init) !void {
         .port = bench_port,
         .router = &router,
         .reuse_address = true,
+        .metrics_interval_s = 0, // Disable metrics logging during benchmarks
     });
     defer server.deinit(io);
 
     const server_thread = try std.Thread.spawn(.{}, struct {
         fn run(s: *http.Server, sio: Io) void {
-            s.run(sio);
+            s.run(sio) catch {};
         }
     }.run, .{ &server, io });
     _ = server_thread;

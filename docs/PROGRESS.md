@@ -2,9 +2,9 @@
 
 ## Project Progress Tracker
 
-> **Last Updated:** 2026-02-17  
+> **Last Updated:** 2026-02-18  
 > **Zig Version:** 0.16.0-dev.2535+b5bd49460  
-> **Status:** STEP 11 IN PROGRESS — Async I/O pool complete, structured concurrency next
+> **Status:** STEP 11b COMPLETE — All 7 structured concurrency sub-steps finished
 
 ---
 
@@ -23,14 +23,14 @@
 | 9 | Build integration & main entry point | ✅ COMPLETE |
 | 10 | Testing, benchmarking & tuning | ✅ COMPLETE |
 | 11a | Async I/O pool (Io.Group dispatch) | ✅ COMPLETE |
-| 11b | Structured concurrency (Kotlin-style scoped lifetimes) | 🔲 NOT STARTED |
-| | 11b-1: Handler signature — pass `Io` to handlers | 🔲 |
-| | 11b-2: Connection scope — idle timeout via `io.select()` | 🔲 |
-| | 11b-3: Request timeout — `withTimeout` around handlers | 🔲 |
-| | 11b-4: Graceful shutdown — cancel/drain server scope | 🔲 |
-| | 11b-5: Handler concurrency — `io.async()` fan-out | 🔲 |
-| | 11b-6: Background tasks — metrics, health monitoring | 🔲 |
-| | 11b-7: Integration tests — verify SC guarantees | 🔲 |
+| 11b | Structured concurrency (Kotlin-style scoped lifetimes) | ✅ COMPLETE |
+| | 11b-1: Handler signature — pass `Io` to handlers | ✅ COMPLETE |
+| | 11b-2: Connection scope — idle timeout via `io.select()` | ✅ COMPLETE |
+| | 11b-3: Request timeout — `withTimeout` around handlers | ✅ COMPLETE |
+| | 11b-4: Graceful shutdown — cancel/drain server scope | ✅ COMPLETE |
+| | 11b-5: Handler concurrency — `io.async()` fan-out | ✅ COMPLETE |
+| | 11b-6: Background tasks — metrics, health monitoring | ✅ COMPLETE |
+| | 11b-7: Integration tests — verify SC guarantees | ✅ COMPLETE |
 
 ---
 
@@ -418,215 +418,120 @@ The steps build on each other. Each is independently testable/committable.
 
 ---
 
-#### 11b-1: Handler Signature Change (Foundation)
+#### 11b-1: Handler Signature Change (COMPLETE)
 
 **Why first:** Every subsequent step needs `Io` inside handlers or connection logic.
 In Kotlin, every coroutine function has access to the `CoroutineScope`. Here, `Io`
 is the equivalent — it's the handle to the async runtime.
 
-**Change `HandlerFn` signature:**
-```zig
-// Before:
-pub const HandlerFn = *const fn (*Request, *Response) anyerror!void;
+**What was done:**
+- Changed `HandlerFn` from `*const fn (*Request, *Response) anyerror!void` to
+  `*const fn (*Request, *Response, Io) anyerror!void`
+- Added `Io` import to `router.zig`
+- Updated `connection.zig` to pass `io` when calling handlers
+- Updated all 4 handlers in `http_server_main.zig` (accept `_: std.Io` for now)
+- Updated all 4 handlers in `integration_test.zig`
+- Updated all 3 handlers in `benchmark.zig`
+- Updated test dummy handlers in `router.zig`
 
-// After:
-pub const HandlerFn = *const fn (*Request, *Response, Io) anyerror!void;
-```
-
-**Files to modify:**
+**Files modified:**
 | File | Change |
 |------|--------|
-| `router.zig` | `HandlerFn` type adds `Io` parameter |
+| `router.zig` | `HandlerFn` type adds `Io` parameter; import `Io`; test handlers updated |
 | `connection.zig` | Pass `io` when calling `match.handler(&request, &response, io)` |
-| `http_server_main.zig` | All 4 handlers gain `io: Io` (use `_ = io;` for now) |
-| `request.zig` | Optionally store `io` in Request for convenience |
-| `integration_test.zig` | Update test handler signatures |
-| `benchmark.zig` | Update benchmark handler signatures |
+| `http_server_main.zig` | All 4 handlers gain `_: std.Io` parameter |
+| `integration_test.zig` | All 4 test handlers gain `_: std.Io` parameter |
+| `benchmark.zig` | All 3 benchmark handlers gain `_: std.Io` parameter |
+
+**Verification:** All 64 unit tests pass. All executables build cleanly.
 
 **Deliverable:** All handlers receive `Io`, enabling structured concurrency in later steps.
 
 ---
 
-#### 11b-2: Connection Scope with Idle Timeout
+#### 11b-2: Connection Scope with Idle Timeout (COMPLETE)
 
 **Model: `coroutineScope { }` per connection with a `withTimeout` on idle reads.**
 
-Each connection becomes its own scope. Inside that scope, an idle-timeout task
-races against the `receiveHead()` call:
+**What was done:**
+- Added `idle_timeout_s: u32 = 30` to `Server.Config` and `Server` struct
+- Created `receiveWithTimeout()` function in `connection.zig` using `io.select()` to
+  race `receiveHead()` against `io.sleep()` — the Zig equivalent of Kotlin's
+  `withTimeout(30.seconds) { receiveHead() }`
+- When `idle_timeout_s > 0`: spawns two concurrent tasks (`receiveHeadAsync` and
+  `idleSleep`) and uses `io.select()` to pick the winner. Loser is canceled.
+- When `idle_timeout_s == 0`: fast path — direct `receiveHead()` call (no timeout)
+- Properly handles cancellation (server shutdown): cancels both futures, returns null
+- Error union discipline: uses `if/else` for non-void results, `catch {}` for void
 
-```zig
-// Kotlin equivalent:
-// coroutineScope {
-//     withTimeout(30.seconds) {
-//         val request = receiveHead()
-//     }
-// }
-
-// Zig equivalent:
-pub fn handleAsync(stream: Io.net.Stream, io: Io, ...) Io.Cancelable!void {
-    defer stream.close(io);
-
-    var arena_state: std.heap.ArenaAllocator = .init(allocator);
-    defer arena_state.deinit();
-
-    // Connection scope — all request processing happens here
-    handleRequests(&arena_state, stream, io, router);
-}
-
-fn handleRequests(arena_state: ..., stream: ..., io: Io, router: ...) void {
-    var read_buffer: [8192]u8 = undefined;
-    var write_buffer: [8192]u8 = undefined;
-    var stream_reader = stream.reader(io, &read_buffer);
-    var stream_writer = stream.writer(io, &write_buffer);
-    var http_server = http.Server.init(&stream_reader.interface, &stream_writer.interface);
-
-    while (true) {
-        // withTimeout(idle_timeout) { receiveHead() }
-        var read_future  = io.async(receiveHeadWrapper, .{&http_server});
-        var sleep_future = io.async(sleepFn, .{ io, idle_timeout });
-
-        const head = switch (io.select(.{ .request = &read_future, .timeout = &sleep_future })) {
-            .request => |result| result catch break,  // parse error → close
-            .timeout => break,                         // idle timeout → close
-        } catch break;  // canceled
-
-        sleep_future.cancel(io);  // cancel whichever didn't fire
-
-        // ... handle request ...
-    }
-}
-```
-
-**Config additions to `Server.Config`:**
-```zig
-/// Idle timeout between requests on a keep-alive connection (seconds).
-/// 0 = no timeout. Default: 30s.
-idle_timeout_s: u32 = 30,
-```
-
-**Files to modify:**
+**Files modified:**
 | File | Change |
 |------|--------|
-| `connection.zig` | Wrap `receiveHead()` in `io.select()` vs `io.sleep()` |
-| `server.zig` | Add `idle_timeout_s` to Config, pass to connection |
+| `connection.zig` | Added `receiveWithTimeout()`, `receiveHeadAsync()`, `idleSleep()`; `idle_timeout_s` param on all entry points |
+| `server.zig` | Added `idle_timeout_s` to Config + Server; passes to `Connection.handleAsync` |
 
-**Deliverable:** Idle connections auto-close after 30s. Freed resources for other connections.
+**Verification:** All 64 unit tests pass. All 10 integration tests pass. All executables build.
+
+**Deliverable:** Idle keep-alive connections auto-close after 30s, freeing resources.
 
 ---
 
-#### 11b-3: Request-Level Timeout
+#### 11b-3: Request-Level Timeout (COMPLETE)
 
 **Model: `withTimeout(10.seconds) { handler(request, response) }`**
 
-Wrap each handler invocation in a select against a deadline. If the handler
-takes too long, cancel it and send 503:
+**What was done:**
+- Renamed `idleSleep` → `sleepSeconds` (shared by idle and request timeouts)
+- Added `callHandlerWrapper` function for dispatching handler via `io.async()`
+- Added `DispatchResult` enum (`ok`, `handler_error`, `timeout`, `canceled`)
+- Added `dispatchHandler` function that races handler vs deadline via `io.select()`
+- On timeout: cancels handler, sends 503 with `CancelProtection` (immune to shutdown cancel)
+- Added `request_timeout_s: u32 = 10` to `Server.Config` and `Server` struct
+- Passed `request_timeout_s` through entire call chain
 
-```zig
-// Kotlin:  withTimeout(10.seconds) { handler(req, res) }
-
-// Zig:
-var handler_future = io.async(match.handler, .{ &request, &response, io });
-var deadline_future = io.async(sleepFn, .{ io, request_timeout });
-
-switch (io.select(.{ .ok = &handler_future, .timeout = &deadline_future })) {
-    .ok => |result| {
-        deadline_future.cancel(io);
-        result catch { sendInternalError(&http_request) catch {}; };
-    },
-    .timeout => {
-        handler_future.cancel(io);
-        // CancelProtection around error response — don't let shutdown
-        // interrupt our 503 write
-        const old = io.swapCancelProtection(.blocked);
-        defer _ = io.swapCancelProtection(old);
-        send503(&stream_writer.interface) catch {};
-    },
-}
-```
-
-**Config additions:**
-```zig
-/// Maximum time for a handler to complete (seconds). 0 = no timeout.
-request_timeout_s: u32 = 10,
-```
-
-**Files to modify:**
+**Files modified:**
 | File | Change |
 |------|--------|
-| `connection.zig` | Wrap handler call in `io.select()` vs deadline |
-| `server.zig` | Add `request_timeout_s` to Config |
+| `connection.zig` | Added `dispatchHandler`, `callHandlerWrapper`, `DispatchResult`; `request_timeout_s` param throughout |
+| `server.zig` | Added `request_timeout_s` to Config + Server; passes to `Connection.handleAsync` |
 
-**Deliverable:** Slow handlers are canceled after N seconds; client gets 503.
+**Verification:** All 64 unit tests pass. All 10 integration tests pass. All executables build.
+
+**Deliverable:** Slow handlers are canceled after N seconds; client gets 503 Service Unavailable.
 
 ---
 
-#### 11b-4: Graceful Shutdown
+#### 11b-4: Graceful Shutdown (COMPLETE)
 
 **Model: Kotlin's `scope.cancel()` + `scope.join()` pattern.**
 
-The server scope (`Io.Group`) owns all connections. On shutdown:
-1. Cancel the accept loop (it sees `error.Canceled` on `accept()`)
-2. In-flight connections receive cancel at their next Io call
-3. Connections use `CancelProtection` to finish writing the current response
-4. `group.await()` blocks until all connections have drained
+**What was done:**
+- Changed `Server.run()` return type from `void` to `Io.Cancelable!void`
+- Added `error.Canceled` handling in the accept loop — stops accepting on shutdown
+- `defer group.cancel(io)` ensures all in-flight connections are canceled and awaited
+- Connections already use `CancelProtection` around 503 writes (from 11b-3)
+- Updated `http_server_main.zig` to handle `error.Canceled` gracefully with a message
+- Updated `integration_test.zig` and `benchmark.zig` to `catch {}` on `run()`
 
-```zig
-// Server.run — now returns when shutdown is requested
-pub fn run(self: *Server, io: Io) Io.Cancelable!void {
-    var group: Io.Group = .init;
-    defer group.cancel(io);  // ensures cleanup on any exit
+**Shutdown flow:**
+1. Caller cancels the server's accept task (via external signal or future cancel)
+2. `accept()` returns `error.Canceled` → accept loop breaks
+3. `defer group.cancel(io)` runs → sends `error.Canceled` to all connection tasks
+4. Each connection finishes its current response (CancelProtection on writes)
+5. `group.cancel()` awaits all tasks → returns when all are drained
+6. `run()` returns `error.Canceled` → caller prints graceful shutdown message
 
-    while (true) {
-        const stream = self.tcp_server.accept(io) catch |err| switch (err) {
-            error.Canceled => break,          // ← shutdown signal
-            error.ConnectionAborted => continue,
-            else => { log(err); continue; },
-        };
-        group.async(io, Connection.handleAsync, .{ stream, io, ... });
-    }
-
-    // Drain: wait for all in-flight connections to finish
-    group.await(io) catch {};  // swallow Canceled from children
-}
-```
-
-**Connection cancel-safety:**
-```zig
-fn handleInner(...) void {
-    while (true) {
-        var http_request = http_server.receiveHead() catch |err| switch (err) {
-            error.Canceled => break,  // shutdown → exit keep-alive loop
-            // ...
-        };
-
-        // ... route + call handler ...
-
-        // CancelProtection: finish writing response even during shutdown
-        {
-            const old = io.swapCancelProtection(.blocked);
-            defer _ = io.swapCancelProtection(old);
-            response.flush() catch {};
-        }
-    }
-}
-```
-
-**Shutdown trigger options:**
-| Approach | Mechanism | Platform |
-|----------|-----------|----------|
-| External cancel | Caller cancels the `Future` returned by `io.async(server.run, ...)` | All |
-| Sentinel event | `Io.Event` set by signal handler thread | All |
-| Signal FD | `posix.signalfd` → readable when SIGTERM received | Linux |
-| Ctrl+C handler | Background thread with `SetConsoleCtrlHandler` | Windows |
-
-**Files to modify:**
+**Files modified:**
 | File | Change |
 |------|--------|
-| `server.zig` | `run()` returns `Io.Cancelable!void`, handle `error.Canceled` in accept |
-| `connection.zig` | `CancelProtection` around response flush; handle `Canceled` in read loop |
-| `http_server_main.zig` | Spawn `server.run` as `io.async()`, set up shutdown trigger |
+| `server.zig` | `run()` returns `Cancelable!void`, handles `error.Canceled` in accept |
+| `http_server_main.zig` | Handles `error.Canceled` from `run()` |
+| `integration_test.zig` | Background server thread catches `run()` error |
+| `benchmark.zig` | Background server thread catches `run()` error |
 
-**Deliverable:** `Ctrl+C` or external signal drains in-flight requests cleanly.
+**Verification:** All 64 unit tests pass. All 10 integration tests pass. All executables build.
+
+**Deliverable:** Server shuts down gracefully — drains in-flight requests before exiting.
 
 ---
 
@@ -696,6 +601,15 @@ fn handleOrder(request: *Request, response: *Response, io: Io) anyerror!void {
 
 **Deliverable:** Example handler demonstrating concurrent sub-tasks with structured lifetime.
 
+**What was done:**
+- Added `/dashboard/:id` route to `http_server_main.zig` demonstrating the fan-out/fan-in pattern
+- `fetchProfile()` and `fetchNotifications()` simulate concurrent async data fetches with `io.sleep()` latency
+- `handleDashboard()` spawns both via `io.async()`, awaits both results, combines into a single response
+- Error handling properly cancels the remaining future if one fails
+- Updated welcome page (`/`) to list the new route
+- All 64 unit tests pass, all 10 integration tests pass, all executables build
+- No framework changes needed — handlers already receive `Io` from 11b-1
+
 ---
 
 #### 11b-6: Background Tasks & Metrics
@@ -757,6 +671,17 @@ pub const Stats = struct {
 
 **Deliverable:** Real-time server metrics logged every 10s; `/metrics` JSON endpoint.
 
+**What was done:**
+- Added `Stats` struct to `server.zig` with atomic counters: `active_connections`, `total_requests`, `total_connections`
+- `metricsReporter()` background task spawned in server scope via `group.async()` — periodically logs stats, automatically canceled on shutdown
+- Connection handler increments `active_connections` on connect (decrements on disconnect via `defer`) and `total_requests` per parsed request
+- Server increments `total_connections` on accept
+- Added `metrics_interval_s` config option (default 10s, 0 = disable)
+- Added `/metrics` route returning JSON: `{"active_connections":N,"total_requests":N,"total_connections":N}`
+- Module-level `server_stats` pointer provides handler access to Stats without framework changes
+- Disabled metrics logging in integration tests and benchmarks to avoid noise
+- All 64 unit tests pass, all 10 integration tests pass, all executables build
+
 ---
 
 #### 11b-7: Structured Concurrency Integration Tests
@@ -781,6 +706,19 @@ pub const Stats = struct {
 | `benchmark.zig` | Optional: timeout-aware benchmarks |
 
 **Deliverable:** Comprehensive test suite proving structured concurrency invariants.
+
+**What was done:**
+- Created second test server on port 18081 with short timeouts (`idle_timeout_s=3`, `request_timeout_s=2`)
+- Added SC-specific handlers: `handleSlow` (sleeps 5s, triggers timeout), `handleFast` (instant), `handleFanOut` (concurrent sub-tasks)
+- 6 new structured concurrency tests:
+  1. **Request timeout fires → 503**: Slow handler exceeds 2s timeout, gets 503 with "Request Timeout"
+  2. **Fast handler under timeout → 200**: Quick handler completes before deadline
+  3. **Fan-out sub-tasks complete**: `io.async()` spawns two concurrent tasks, both results present in response
+  4. **Server stable after timeouts**: Server continues accepting after timeout/cancel activity
+  5. **Timeout yields 503 then closes**: Connection properly closes after request timeout
+  6. **Active conn not timed out**: Active connections don't trigger idle timeout
+- Total test count: 16/16 pass (10 original + 6 SC tests)
+- All 64 unit tests pass, all executables build
 
 ---
 
