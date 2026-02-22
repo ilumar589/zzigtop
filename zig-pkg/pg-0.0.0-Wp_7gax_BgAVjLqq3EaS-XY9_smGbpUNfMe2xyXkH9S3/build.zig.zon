@@ -1,0 +1,18 @@
+.{
+    .name = .pg,
+    .paths = .{""},
+    .version = "0.0.0",
+    .fingerprint = 0xbd309ff281fb9f5a,
+    .dependencies = .{
+        .buffer = .{
+            // @karl - you will need to change this to point to your updated buffer.zig
+            // Problem with the latest zig pkg tools is that the NEED a build.zig.zon by the looks of it,
+            .url = "git+https://github.com/zigster64/buffer.zig.git?ref=dev#027af392db4c2ad6ceab52e433a0240e57870c0f",
+            .hash = "buffer-0.0.0-nwPMfeePAADhrU7zCQhjqMW7UzQIIjt7L0rvxG2aKLtG",
+        },
+        .metrics = .{
+            .url = "git+https://github.com/karlseguin/metrics.zig?ref=dev#fbd0cfc37bd4004ab00c178a2ca2e22d7ee234bc",
+            .hash = "metrics-0.0.0-W7G4eEHAAQBmqC12Q4lYxrm_V1VwmiUzcPYqVVJs8Oxf",
+        },
+    },
+}

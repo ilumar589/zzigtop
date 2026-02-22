@@ -269,6 +269,195 @@ optimizations (constant propagation, dead code elimination) at the call site.
 
 ---
 
+## 12. Structure of Arrays (SoA) Layout
+
+**What:** Instead of storing an array of structs (AoS), decompose data into
+separate arrays for each primitive field. Each array holds only one field type,
+packed contiguously in memory.
+
+**Why:** When an operation touches only one or two fields of a struct, AoS
+layout wastes cache lines loading unused fields. SoA ensures every byte in a
+cache line is relevant data, maximizing throughput for field-specific scans,
+SIMD operations, and prefetcher efficiency.
+
+**Example — Array of Structs (AoS) — wasteful:**
+```zig
+const Point = struct {
+    x: f32,
+    y: f32,
+    z: f32,
+    label: u8,
+};
+// All fields interleaved in memory: x₀ y₀ z₀ l₀ x₁ y₁ z₁ l₁ ...
+var points: [1024]Point = undefined;
+```
+
+If you only need to sum all `x` values, each cache line fetch pulls in `y`, `z`,
+and `label` too — 75% wasted bandwidth.
+
+**Example — Structure of Arrays (SoA) — optimal:**
+```zig
+const Points = struct {
+    xs: []f32,   // x₀ x₁ x₂ x₃ ... contiguous
+    ys: []f32,   // y₀ y₁ y₂ y₃ ... contiguous
+    zs: []f32,   // z₀ z₁ z₂ z₃ ... contiguous
+    labels: []u8, // l₀ l₁ l₂ l₃ ... contiguous
+};
+```
+
+Now summing all `x` values reads only `xs` — every byte in every cache line is
+a useful `f32`. The hardware prefetcher excels at sequential access, and SIMD
+can process 4× `f32` (or 8× with AVX) per instruction with no gather overhead.
+
+**Key rule: decompose to the smallest primitives.** Don't stop at splitting a
+struct into two sub-structs — go all the way down to `[]f32`, `[]u32`, `[]u8`,
+etc. This maximizes the density of useful data per cache line and makes SIMD
+vectorisation trivial.
+
+**When to use SoA:**
+- Hot loops that access only a subset of fields
+- SIMD processing (contiguous same-type arrays vectorise naturally)
+- Large collections (N > ~64) where cache effects dominate
+- Columnar scans, filtering, or aggregation
+
+**When AoS is fine:**
+- Small collections where everything fits in cache
+- Operations that always touch all fields together
+- Data primarily accessed by individual record (e.g., lookup by ID)
+
+**Impact:** Up to 2-4× throughput improvement for field-specific operations
+due to reduced cache misses and enabling auto-vectorisation. The benefit grows
+with collection size and the ratio of unused-to-used fields per operation.
+
+---
+
+## 13. Arena-Backed JSON Parsing (parseFromSliceLeaky)
+
+**File:** `request.zig`
+
+**What:** JSON request bodies are deserialized into typed Zig structs using
+`std.json.parseFromSliceLeaky()`, which allocates all parse state and output
+into the per-request arena allocator.
+
+**Why:** The standard `parseFromSlice()` creates its own internal `ArenaAllocator`
+with a separate `Parsed(T)` wrapper that must be individually freed. Since we
+already have a per-request arena, the "Leaky" variant avoids this double-arena
+overhead — all allocations go directly into our existing arena and are freed in
+one O(1) bulk reset.
+
+**Zig implementation:**
+```zig
+pub fn jsonBody(self: *Request, comptime T: type) !T {
+    const body = self.body orelse return error.NoBody;
+    return std.json.parseFromSliceLeaky(T, self.arena, body, .{
+        .ignore_unknown_fields = true,
+    });
+}
+```
+
+**Performance characteristics:**
+- **Zero-copy strings:** When parsing from a `[]const u8` slice, string values
+  in the resulting struct are slices pointing directly into the original body
+  buffer (`.alloc_if_needed` default). No string duplication for most fields.
+- **Arena bump allocation:** All temporary parse state (stack, intermediate
+  values) uses the arena's bump pointer — just a pointer increment per alloc.
+- **O(1) cleanup:** Everything is freed when the arena resets between requests.
+  No per-field destructor calls, no reference counting.
+- **No separate Parsed(T) wrapper:** Avoids the overhead of allocating and
+  managing a separate ArenaAllocator for each parse operation.
+
+**Impact:** JSON parsing adds near-zero overhead beyond the parsing work itself.
+No malloc/free calls, no fragmentation, no GC pauses.
+
+---
+
+## 14. Arena-Backed JSON Serialization (Stringify.valueAlloc)
+
+**File:** `response.zig`
+
+**What:** Zig structs are serialized to JSON using `std.json.Stringify.valueAlloc()`,
+which writes the JSON bytes into arena-allocated memory, then sent as the
+response body via the existing vectored write path.
+
+**Why:** Serializing to an intermediate `[]const u8` buffer (rather than streaming
+directly to the socket) allows us to compute `Content-Length` before sending headers.
+Using the arena for this buffer means no allocation overhead — just a bump pointer.
+
+**Zig implementation:**
+```zig
+pub fn sendJsonValue(self: *Response, status: http.Status, value: anytype) !void {
+    const body = try std.json.Stringify.valueAlloc(self.arena, value, .{});
+    self.status = status;
+    self.body = body;
+    try self.addHeader("content-type", "application/json; charset=utf-8");
+    try self.flush();
+}
+```
+
+**Performance characteristics:**
+- **Comptime-driven serialization:** `Stringify.write()` uses comptime reflection
+  to generate field-specific serialization code at compile time — no runtime
+  type inspection, no virtual dispatch.
+- **Arena buffer reuse:** The serialized JSON lives in the arena. Between requests,
+  `arena.reset(.retain_capacity)` resets the pointer without freeing pages —
+  subsequent requests reuse the same memory.
+- **Single vectored write:** The serialized body goes through the existing
+  `flush()` path which combines status line + headers + body in one `writev`.
+
+**Impact:** JSON serialization is essentially a comptime-generated `memcpy` into
+arena memory, followed by a single syscall to write the full response.
+
+---
+
+## 15. Connection Pool Performance
+
+**File:** `src/db/database.zig`, `src/db/user_repository.zig`
+
+**What:** Database connections are pre-opened in a fixed-size pool. Each query
+acquires a connection, executes, and returns it — no TCP handshake or
+authentication per query. The pool is async-aware via `std.Io`.
+
+**Why:** PostgreSQL connection setup involves TCP connect + TLS negotiation +
+authentication + parameter exchange — typically 5-20ms. With pooling, only the
+first `pool_size` connections pay this cost; subsequent queries reuse them.
+
+**Zig implementation:**
+```zig
+// Pool wraps pg.Pool — init opens `pool_size` connections upfront
+pub fn init(allocator: Allocator, io: Io, config: Config) !Database {
+    const pool = try pg.Pool.init(allocator, io, .{
+        .size = config.pool_size,            // Fixed pool (default: 5)
+        .timeout = Io.Duration.fromSeconds(config.timeout_seconds),
+        .connect = .{ .host = config.host, .port = config.port },
+        .auth = .{ .username = ..., .database = ..., .password = ... },
+    });
+    return .{ .pool = pool };
+}
+
+// Queries auto-acquire/release through the pool
+pub fn query(self: *Database, sql: []const u8, values: anytype) !*Result {
+    return self.pool.query(sql, values);
+}
+```
+
+**Performance characteristics:**
+- **Amortized connection cost:** 5 connections opened once at startup; all HTTP
+  requests share them without re-connecting.
+- **Parameterized queries (binary protocol):** Data sent as binary parameters
+  (`$1`, `$2`, ...), not interpolated strings. This eliminates SQL parsing
+  overhead for repeated queries and provides SQL injection safety for free.
+- **Arena-friendly results:** `UserRepository` methods accept an arena allocator
+  for string duplication. Row data is duped once and then freed in bulk with the
+  request arena — no per-field deallocation.
+- **Async-aware timeout:** `Io.Duration` integrates with Zig's I/O runtime so
+  pool acquisition yields the fiber/thread instead of busy-waiting.
+
+**Impact:** Database queries add ~0.5-2ms latency per request (network round-trip)
+instead of 5-20ms (if connecting per request). The binary protocol also avoids
+query re-parsing overhead on the PostgreSQL side.
+
+---
+
 ## Techniques NOT Used (and Why)
 
 ### io_uring / IOCP

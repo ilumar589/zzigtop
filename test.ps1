@@ -4,6 +4,7 @@
 #  Usage: powershell -ExecutionPolicy Bypass -File test.ps1
 #         powershell -ExecutionPolicy Bypass -File test.ps1 -Verbose
 #         powershell -ExecutionPolicy Bypass -File test.ps1 -Integration
+#         powershell -ExecutionPolicy Bypass -File test.ps1 -DbIntegration
 #         powershell -ExecutionPolicy Bypass -File test.ps1 -Benchmark
 #         powershell -ExecutionPolicy Bypass -File test.ps1 -All
 # ------------------------------------------------------------------
@@ -11,6 +12,7 @@
 param(
     [switch]$Verbose,
     [switch]$Integration,
+    [switch]$DbIntegration,
     [switch]$Benchmark,
     [switch]$All
 )
@@ -51,9 +53,10 @@ function Write-Info {
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
 
 # -- Determine what to run -----------------------------------------
-$runUnit        = (-not $Integration -and -not $Benchmark) -or $All
-$runIntegration = $Integration -or $All
-$runBenchmark   = $Benchmark -or $All
+$runUnit            = (-not $Integration -and -not $DbIntegration -and -not $Benchmark) -or $All
+$runIntegration     = $Integration -or $All
+$runDbIntegration   = $DbIntegration -or $All
+$runBenchmark       = $Benchmark -or $All
 
 $globalExit = 0
 
@@ -216,7 +219,70 @@ if ($runIntegration) {
 }
 
 # ===================================================================
-#  PHASE 3: Benchmark (optional, not a pass/fail gate)
+#  PHASE 3: Database Integration Tests (requires PostgreSQL)
+# ===================================================================
+if ($runDbIntegration) {
+    Write-Header "DB Integration Tests  (zig build db-integration-test)"
+
+    Write-Host "  Building & running..." -ForegroundColor Yellow -NoNewline
+
+    $dbOutput = & zig build db-integration-test 2>&1 | Out-String
+    $dbExit   = $LASTEXITCODE
+
+    Write-Host "`r  Building & running... done.          " -ForegroundColor DarkGray
+
+    # Parse lines like: PASS <name> / FAIL <name>
+    $dbPassed = 0
+    $dbFailed = 0
+    $dbFailedTests = @()
+
+    foreach ($rawLine in ($dbOutput -split "`n")) {
+        $l = $rawLine.Trim()
+
+        if ($l -match 'PASS\s+(.+)$') {
+            $dbPassed++
+            if ($Verbose) { Write-Pass $Matches[1] }
+        }
+        elseif ($l -match 'FAIL\s+(.+)$') {
+            $dbFailed++
+            $dbFailedTests += $Matches[1]
+            Write-Fail $Matches[1]
+        }
+        elseif ($l -match 'Results:\s*(\d+)/(\d+)\s+passed,\s*(\d+)\s+failed') {
+            $dbPassed = [int]$Matches[1]
+            $dbFailed = [int]$Matches[3]
+        }
+    }
+
+    $dbTotal = $dbPassed + $dbFailed
+
+    if ($dbFailed -eq 0 -and $dbExit -eq 0 -and $dbTotal -gt 0) {
+        Write-Host ""
+        Write-Host "    $check ALL $dbTotal DB INTEGRATION TESTS PASSED" -ForegroundColor Green
+        Write-Host "    $check $dbPassed passed" -ForegroundColor Green
+    } elseif ($dbTotal -eq 0) {
+        $globalExit = 1
+        Write-Host ""
+        Write-Host "    $cross BUILD / RUN FAILED (no test results)" -ForegroundColor Red
+        Write-Host "    Make sure PostgreSQL is running: cd docker && docker compose up -d" -ForegroundColor Yellow
+        $diagLines = ($dbOutput -split "`n") | Select-Object -First 10
+        foreach ($dl in $diagLines) {
+            Write-Info $dl.Trim()
+        }
+    } else {
+        $globalExit = 1
+        Write-Host ""
+        Write-Host "    $cross $dbFailed / $dbTotal DB INTEGRATION TESTS FAILED" -ForegroundColor Red
+        if ($dbFailedTests.Count -gt 0) {
+            foreach ($ft in $dbFailedTests) {
+                Write-Host "      $cross $ft" -ForegroundColor Red
+            }
+        }
+    }
+}
+
+# ===================================================================
+#  PHASE 4: Benchmark (optional, not a pass/fail gate)
 # ===================================================================
 if ($runBenchmark) {
     Write-Header "Benchmark  (zig build benchmark -Doptimize=ReleaseFast)"
@@ -292,9 +358,10 @@ Write-Host ""
 Write-Host "  $line" -ForegroundColor DarkCyan
 
 $phases = @()
-if ($runUnit)        { $phases += "unit" }
-if ($runIntegration) { $phases += "integration" }
-if ($runBenchmark)   { $phases += "benchmark" }
+if ($runUnit)            { $phases += "unit" }
+if ($runIntegration)     { $phases += "integration" }
+if ($runDbIntegration)   { $phases += "db-integration" }
+if ($runBenchmark)       { $phases += "benchmark" }
 
 $phasesStr = $phases -join " + "
 

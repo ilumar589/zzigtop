@@ -2,11 +2,15 @@
 //!
 //! Builds a response with status, headers, and body, then flushes
 //! everything in a single vectored write for maximum throughput.
+//!
+//! Supports typed JSON serialization via `std.json.Stringify.valueAlloc`,
+//! which serializes any Zig struct directly into arena-allocated bytes.
 
 const std = @import("std");
 const http = std.http;
 const mem = std.mem;
 const Io = std.Io;
+const json = std.json;
 
 const Response = @This();
 
@@ -130,6 +134,26 @@ pub fn sendJson(self: *Response, status: http.Status, body: []const u8) !void {
     try self.flush();
 }
 
+/// Serialize any Zig value as a JSON response.
+///
+/// Uses `std.json.Stringify.valueAlloc` to convert the value into
+/// an arena-allocated JSON string, then sends it with the correct
+/// Content-Type header.
+///
+/// The serialized JSON lives in the request arena and is freed
+/// in one O(1) bulk reset when the request completes.
+///
+/// Example:
+///   const result = .{ .id = 1, .name = "Alice", .active = true };
+///   try response.sendJsonValue(.ok, result);
+pub fn sendJsonValue(self: *Response, status: http.Status, value: anytype) !void {
+    const body = try json.Stringify.valueAlloc(self.arena, value, .{});
+    self.status = status;
+    self.body = body;
+    try self.addHeader("content-type", "application/json; charset=utf-8");
+    try self.flush();
+}
+
 // ---- Tests ----
 
 test "setStatus" {
@@ -237,4 +261,35 @@ test "setBodyWithType sets body and adds header" {
     try std.testing.expectEqual(@as(usize, 1), response.extra_header_count);
     try std.testing.expectEqualStrings("content-type", response.extra_header_buf[0].name);
     try std.testing.expectEqualStrings("text/html", response.extra_header_buf[0].value);
+}
+
+// ---- JSON serialization tests ----
+
+test "json.Stringify.valueAlloc - simple struct" {
+    const gpa = std.testing.allocator;
+    const value = .{ .name = "Alice", .age = @as(u32, 30), .active = true };
+    const result = try json.Stringify.valueAlloc(gpa, value, .{});
+    defer gpa.free(result);
+    try std.testing.expectEqualStrings("{\"name\":\"Alice\",\"age\":30,\"active\":true}", result);
+}
+
+test "json.Stringify.valueAlloc - nested struct" {
+    const gpa = std.testing.allocator;
+    const Inner = struct { x: i32, y: i32 };
+    const value = .{ .point = Inner{ .x = 10, .y = 20 }, .label = "origin" };
+    const result = try json.Stringify.valueAlloc(gpa, value, .{});
+    defer gpa.free(result);
+    try std.testing.expectEqualStrings("{\"point\":{\"x\":10,\"y\":20},\"label\":\"origin\"}", result);
+}
+
+test "json.Stringify.valueAlloc - optional fields" {
+    const gpa = std.testing.allocator;
+    const Data = struct {
+        name: []const u8,
+        email: ?[]const u8 = null,
+    };
+    const value = Data{ .name = "Bob", .email = null };
+    const result = try json.Stringify.valueAlloc(gpa, value, .{});
+    defer gpa.free(result);
+    try std.testing.expectEqualStrings("{\"name\":\"Bob\",\"email\":null}", result);
 }

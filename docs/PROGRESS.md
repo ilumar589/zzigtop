@@ -2,9 +2,9 @@
 
 ## Project Progress Tracker
 
-> **Last Updated:** 2026-02-18  
+> **Last Updated:** 2026-02-22  
 > **Zig Version:** 0.16.0-dev.2535+b5bd49460  
-> **Status:** STEP 11b COMPLETE — All 7 structured concurrency sub-steps finished
+> **Status:** STEP 13 COMPLETE — PostgreSQL database integration
 
 ---
 
@@ -31,6 +31,18 @@
 | | 11b-5: Handler concurrency — `io.async()` fan-out | ✅ COMPLETE |
 | | 11b-6: Background tasks — metrics, health monitoring | ✅ COMPLETE |
 | | 11b-7: Integration tests — verify SC guarantees | ✅ COMPLETE |
+| 12 | JSON body parsing & struct serialization | ✅ COMPLETE |
+| | 12-1: Request body reading (`readBody`) | ✅ COMPLETE |
+| | 12-2: JSON → struct deserialization (`jsonBody(T)`) | ✅ COMPLETE |
+| | 12-3: Struct → JSON response (`sendJsonValue`) | ✅ COMPLETE |
+| | 12-4: Handler demos & tests | ✅ COMPLETE |
+| 13 | PostgreSQL database integration | ✅ COMPLETE |
+| | 13-1: Add pg.zig dependency & build integration | ✅ COMPLETE |
+| | 13-2: Docker Compose setup (PostgreSQL 16) | ✅ COMPLETE |
+| | 13-3: Database module (`database.zig` — pool wrapper) | ✅ COMPLETE |
+| | 13-4: User repository (CRUD with parameterized queries) | ✅ COMPLETE |
+| | 13-5: REST API handlers (JSON + DB) | ✅ COMPLETE |
+| | 13-6: Integration tests & documentation | ✅ COMPLETE |
 
 ---
 
@@ -787,3 +799,636 @@ pub const Stats = struct {
 6. **Arenas are per-connection, not per-thread** — fibers migrate between OS threads
    in the Evented backend. Thread-local state is unsound. Arenas travel with the
    fiber/task stack.
+
+---
+
+## Step 12: JSON Body Parsing & Struct Serialization (IN PROGRESS)
+
+**Goal:** Enable handlers to parse incoming JSON request bodies into typed Zig
+structs, and serialize Zig structs back as JSON responses — using `std.json`
+from the standard library with arena-per-request for zero-cost cleanup.
+
+### Design
+
+**Zig's `std.json` standard library provides:**
+- `std.json.parseFromSliceLeaky(T, allocator, slice, opts)` — deserialize JSON
+  bytes into a Zig struct `T`. The "Leaky" variant skips individual cleanup
+  tracking — perfect for arena allocators where everything is freed in bulk.
+- `std.json.Stringify` — streaming serializer that writes any Zig struct/value
+  directly to an `Io.Writer`. No intermediate `[]const u8` buffer needed.
+
+### Sub-steps
+
+#### 12-1: Request Body Reading (`readBody`)
+
+**File:** `request.zig`, `connection.zig`
+
+**What:** Add `Request.readBody()` that reads the full request body into an
+arena-allocated `[]const u8`. Requires passing a body `*Io.Reader` from the
+connection layer into the Request.
+
+**How body reading works in `std.http.Server`:**
+```zig
+// After receiveHead(), get a body reader:
+const body_reader: *Io.Reader = http_request.readerExpectNone(&body_buffer);
+// Read all content into arena:
+const body: []const u8 = body_reader.allocRemaining(arena, max_body_size);
+```
+
+**Key design choice:** The body reader is obtained from `http.Server.Request`
+and consumes the underlying TCP stream. It must be called once per request and
+before sending the response. We store the resulting `[]const u8` on the Request
+so handlers can access it repeatedly.
+
+**Performance:**
+- Body is read into the arena (O(1) bulk free at request end)
+- `allocRemaining()` reads directly into arena-allocated memory (single copy
+  from kernel → userspace → arena, no intermediate buffer)
+- Max body size is configurable (default 1MB) to prevent OOM attacks
+
+#### 12-2: JSON → Struct Deserialization (`jsonBody(T)`)
+
+**File:** `request.zig`
+
+**What:** Add `Request.jsonBody(comptime T: type) !T` that:
+1. Reads the body (if not already read)
+2. Validates `Content-Type: application/json`
+3. Calls `std.json.parseFromSliceLeaky(T, arena, body, .{})`
+
+**Zig implementation plan:**
+```zig
+pub fn jsonBody(self: *Request, comptime T: type) !T {
+    const body = self.body orelse return error.NoBody;
+    return std.json.parseFromSliceLeaky(T, self.arena, body, .{
+        .ignore_unknown_fields = true,
+    });
+}
+```
+
+**Performance:**
+- `parseFromSliceLeaky` allocates into the request arena — all temporary
+  parse state and the resulting struct are freed in one O(1) arena reset
+- String values in the parsed struct are slices into `body` when possible
+  (`.alloc_if_needed` default for `parseFromSlice`) — zero-copy for most strings
+- No separate `Parsed(T)` wrapper with its own arena — we reuse the request arena
+- `ignore_unknown_fields = true` for forward compatibility (clients can add fields)
+
+#### 12-3: Struct → JSON Response (`sendJsonValue`)
+
+**File:** `response.zig`
+
+**What:** Add `Response.sendJsonValue(status, value)` that serializes any Zig
+struct directly to the HTTP response as JSON.
+
+**Challenge:** We need to know Content-Length before sending headers, but
+`Stringify` is a streaming writer. Two approaches:
+
+- **Option A:** Serialize to an arena-allocated buffer first, then send with
+  known Content-Length. Simple, but requires buffering the entire JSON.
+- **Option B:** Use chunked transfer encoding to stream without knowing length.
+  More complex, but zero-copy streaming.
+
+**Chosen: Option A** — serialize to arena buffer, then send. Reasons:
+- Most JSON API responses are small (< 64KB)
+- Keeps Content-Length header (simpler for clients)
+- Arena allocation is nearly free (bump pointer)
+- Matches existing `sendJson()` pattern
+
+**Zig implementation plan:**
+```zig
+pub fn sendJsonValue(self: *Response, status: http.Status, value: anytype) !void {
+    const body = try std.json.valueAlloc(self.arena, value, .{});
+    self.status = status;
+    self.body = body;
+    try self.addHeader("content-type", "application/json; charset=utf-8");
+    try self.flush();
+}
+```
+
+**Performance:**
+- `std.json.Stringify.valueAlloc()` serializes into arena memory
+- Arena buffer reused across requests (retain_capacity)
+- Single vectored write for the full response (existing `flush()` path)
+- No `std.fmt` formatting overhead — Stringify writes directly
+
+#### 12-4: Handler Demos & Tests
+
+**File:** `http_server_main.zig`, `request.zig`, `response.zig`
+
+**What:**
+- Add `POST /api/echo-json` handler that parses JSON body and echoes it back
+- Add unit tests for `readBody()`, `jsonBody(T)`, `sendJsonValue()`
+- Update integration tests
+
+**Example handler:**
+```zig
+const CreateUser = struct {
+    name: []const u8,
+    email: []const u8,
+    age: ?u32 = null,
+};
+
+fn handleCreateUser(request: *http.Request, response: *http.Response, _: std.Io) anyerror!void {
+    const user = try request.jsonBody(CreateUser);
+    // user.name, user.email, user.age are now typed fields
+    // user.name is a slice into the request body buffer (zero-copy!)
+    const result = .{ .id = 1, .name = user.name, .created = true };
+    try response.sendJsonValue(.created, result);
+}
+```
+
+### Performance Summary
+
+| Operation | Allocation | Copies | Cleanup |
+|-----------|-----------|--------|---------|
+| Body read | Arena bump | 1 (kernel→arena) | O(1) arena reset |
+| JSON parse | Arena bump (leaky) | 0 (slices into body) | O(1) arena reset |
+| JSON serialize | Arena bump | 1 (struct→buffer) | O(1) arena reset |
+| Full response | Vectored write | 1 (buffer→socket) | O(1) arena reset |
+
+Everything goes through the per-request arena. No malloc, no free, no GC.
+---
+
+## Step 13: PostgreSQL Database Integration (COMPLETE)
+
+### Overview
+
+Add a full database layer to the HTTP server using **pg.zig** — a native,
+pure-Zig PostgreSQL driver. This step introduces:
+
+- A connection pool backed by `pg.Pool`
+- Docker Compose for local PostgreSQL 16
+- A repository pattern for type-safe CRUD operations
+- REST API handlers wiring JSON (Step 12) to the database
+- **SQL injection prevention** via PostgreSQL's native parameterized query
+  protocol (parameters are sent as binary data, never interpolated into SQL)
+
+### Implementation Notes (Completed Sub-Steps)
+
+#### Zig 0.16 Compatibility Issue & Resolution
+
+pg.zig `master` targets Zig 0.15 and is **incompatible** with Zig 0.16.0-dev:
+- `std.Thread.Mutex` → moved to `std.atomic.Mutex`
+- `@Type` builtin → removed/changed (used in metrics.zig dependency)
+- `Step.Compile.addLibraryPath()` → `Module.addLibraryPath()`
+
+**Solution:** Switched to the **zigster64/pg.zig `zig16` branch** — an active
+community fork (28 commits ahead of master, PR #107) that ports all pg.zig
+dependencies (metrics.zig, buffer) to Zig 0.16's new async I/O (`std.Io`) and
+updated stdlib APIs.
+
+```powershell
+zig fetch --save git+https://github.com/zigster64/pg.zig#zig16
+```
+
+#### API Differences (zig16 branch vs master)
+
+| API | pg.zig master (Zig 0.15) | pg.zig zig16 |
+|-----|--------------------------|--------------|
+| `Pool.init()` | `(allocator, opts)` | `(allocator, io, opts)` — **requires `std.Io`** |
+| `Pool.Opts.timeout` | `u32` (milliseconds) | `Io.Duration` (`.fromSeconds(10)`) |
+| `pool.query()` | Returns `Result` (value) | Returns `*Result` (pointer) |
+| `pool.exec()` | Returns `?usize` | Returns `?i64` |
+| `pool.row()` | Returns `?QueryRow` | Returns `?QueryRow` (value, use `var qr = qr_val;` for mutability) |
+| `Conn.open()` | `(allocator, opts)` | `(allocator, io, opts)` |
+| `std.ArrayList` | `.init(allocator)` | `.empty` + `.append(allocator, item)` (Zig 0.16 stdlib change) |
+
+#### 13-1: pg.zig Dependency ✅
+
+- Added `zigster64/pg.zig#zig16` to `build.zig.zon` via `zig fetch --save`
+- Added `pg_dep` and `pg_module` to `build.zig`, imported to both `mod` and `http_server_exe`
+- All transitive dependencies (buffer, metrics) resolve and compile on Zig 0.16
+
+#### 13-2: Docker Compose ✅
+
+- Created `docker/compose.yml` — PostgreSQL 16 with healthcheck
+- Created `docker/init.sql` — `users` table + 3 seed rows (Alice, Bob, Charlie)
+- Port 5432, credentials: ziglearn/ziglearn
+
+#### 13-3: Database Module ✅
+
+- Created `src/http/database.zig` — thin wrapper around `pg.Pool`
+- `Config` struct with sensible defaults matching Docker Compose setup
+- `init(allocator, io, config)` accepts `std.Io` for the async runtime
+- Convenience methods: `query()`, `exec()`, `row()`, `acquire()`, `release()`
+
+#### 13-4: User Repository ✅
+
+- Created `src/http/user_repository.zig`
+- `User` struct: `id: i32, name: []const u8, email: []const u8, age: ?i32`
+- CRUD: `getAll()`, `getById()`, `create()`, `update()`, `delete()`
+- **All queries use `$1`, `$2` parameterized placeholders** — zero SQL string interpolation
+- String fields duped into caller's arena via `qr.to(User, .{ .allocator = arena })`
+- `var qr = qr_val;` pattern for mutable QueryRow access (Zig 0.16 const-capture semantics)
+
+#### 13-5: REST API Handlers ✅
+
+- 5 new routes registered in comptime router:
+  - `GET /api/users`, `POST /api/users`
+  - `GET /api/users/:id`, `PUT /api/users/:id`, `DELETE /api/users/:id`
+- CLI arguments: `--no-db`, `--db-host`, `--db-port`
+- Graceful DB fallback: if PostgreSQL unreachable, server starts without DB (503 on DB routes)
+- `global_db` module-level `?*http.Database` set during startup
+- Helper: `getUserRepo()` returns `?UserRepository` or sends 503
+- Helper: `parseUserId()` parses `:id` param as `i32` or sends 400
+- Updated index handler to list REST API routes
+- Startup banner shows DB status (connected/disabled)
+
+### Why pg.zig?
+
+| Criterion | pg.zig | libpq (C bindings) |
+|-----------|--------|--------------------|
+| Language | Pure Zig | C via `@cImport` |
+| Stars | 492 | N/A (PostgreSQL official) |
+| Connection Pool | Built-in (`pg.Pool`) | External (PgBouncer) |
+| Parameterized Queries | `$1`, `$2` binary protocol | `PQexecParams` |
+| Row → Struct Mapping | `row.to(T, .{})` | Manual |
+| Prepared Stmt Cache | Built-in (`cache_name`) | Manual |
+| Transactions | `conn.begin/commit/rollback` | Raw SQL |
+| Zig Version | 0.15+ (actively updated) | Any (C ABI stable) |
+| Windows Support | ✅ (PR #98 merged) | Requires libpq DLL |
+| Dependencies | Zero | libpq, potentially OpenSSL |
+
+**Decision: pg.zig** — pure Zig, zero external dependencies, built-in pooling,
+type-safe row mapping, and actively maintained (last commit: 4 days ago).
+
+### SQL Injection Prevention Strategy
+
+pg.zig uses **PostgreSQL's extended query protocol** where SQL and parameters
+are sent in separate protocol messages. The flow is:
+
+```
+Client → Server:  Parse("SELECT * FROM users WHERE id = $1")
+Client → Server:  Bind(parameters: [42])    ← binary data, NOT string interpolation
+Client → Server:  Execute
+Server → Client:  DataRow(...)
+```
+
+Parameters **never touch the SQL parser**. Even if a user sends
+`'; DROP TABLE users; --` as a parameter, PostgreSQL treats it as a literal
+string value, not SQL. This is the gold standard for injection prevention —
+superior to string escaping.
+
+**Rules we enforce:**
+1. **All queries use `$1`, `$2`, ... placeholders** — no string concatenation
+2. **No `std.fmt` for SQL** — never `std.fmt.bufPrint("WHERE id = {d}", .{id})`
+3. **pg.zig binds values via the binary protocol** — type-checked at bind time
+4. **Column reads are type-strict** — `row.get(i32, 0)` fails on type mismatch
+
+### Async Integration Analysis
+
+**How pg.zig works with `std.Io`:**
+
+pg.zig uses `std.net.Stream` for TCP communication. On Zig 0.16:
+
+- **Threaded backend (Windows):** Each HTTP handler runs on a thread pool
+  thread. pg.zig's blocking socket calls execute normally — the thread blocks
+  during DB I/O, but other connections continue on other threads. This is the
+  standard thread-per-request model used by most database drivers.
+
+- **Evented backend (Linux io_uring / macOS kqueue):** Zig's fiber scheduler
+  intercepts socket syscalls. When pg.zig calls `read()` on its socket, the
+  runtime suspends the fiber and resumes it when data arrives. This gives us
+  **non-blocking DB I/O for free** — no code changes needed.
+
+**Connection pool thread safety:** `pg.Pool` is designed for multi-threaded use.
+`acquire()` and `release()` are thread-safe. The pool runs one background thread
+for reconnecting failed connections.
+
+### Sub-Steps
+
+#### 13-1: Add pg.zig Dependency & Build Integration
+
+**What:** Add pg.zig as a Zig package dependency and wire it into the build.
+
+**Commands:**
+```powershell
+cd c:\Projects\Personal\learn-zig-main
+zig fetch --save git+https://github.com/karlseguin/pg.zig#master
+```
+
+**build.zig.zon changes:** `zig fetch --save` auto-adds the dependency with hash.
+
+**build.zig changes:** Add pg module to http_server_exe:
+```zig
+const pg_module = b.dependency("pg", .{
+    .target = target,
+    .optimize = optimize,
+}).module("pg");
+
+// Add to http_server_exe's imports:
+.imports = &.{
+    .{ .name = "learn_zig", .module = mod },
+    .{ .name = "pg", .module = pg_module },
+},
+```
+
+#### 13-2: Docker Compose Setup (PostgreSQL 16)
+
+**Files to create:**
+- `docker/compose.yml` — PostgreSQL 16 service
+- `docker/init.sql` — Schema initialization (runs on first `docker compose up`)
+
+**docker/compose.yml:**
+```yaml
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: "ziglearn"
+      POSTGRES_PASSWORD: "ziglearn"
+      POSTGRES_DB: "ziglearn"
+    ports:
+      - "5432:5432"
+    volumes:
+      - "./init.sql:/docker-entrypoint-initdb.d/init.sql:ro"
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ziglearn"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  pgdata:
+```
+
+**docker/init.sql:**
+```sql
+-- Users table for CRUD demo
+CREATE TABLE IF NOT EXISTS users (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    email VARCHAR(255) NOT NULL UNIQUE,
+    age INT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Seed data
+INSERT INTO users (name, email, age) VALUES
+    ('Alice', 'alice@example.com', 30),
+    ('Bob', 'bob@example.com', 25),
+    ('Charlie', 'charlie@example.com', 35);
+```
+
+**Usage:**
+```powershell
+cd docker
+docker compose up -d       # Start PostgreSQL in background
+docker compose down        # Stop
+docker compose down -v     # Stop and delete data volume
+```
+
+#### 13-3: Database Module (`src/http/database.zig`)
+
+**What:** Thin wrapper around `pg.Pool` for server lifecycle integration.
+
+**Design:**
+```zig
+const pg = @import("pg");
+
+pub const Database = struct {
+    pool: *pg.Pool,
+
+    pub const Config = struct {
+        host: []const u8 = "127.0.0.1",
+        port: u16 = 5432,
+        username: []const u8 = "ziglearn",
+        password: []const u8 = "ziglearn",
+        database: []const u8 = "ziglearn",
+        pool_size: u32 = 10,
+        timeout: u32 = 10_000,
+    };
+
+    pub fn init(allocator: std.mem.Allocator, config: Config) !Database {
+        const pool = try pg.Pool.init(allocator, .{
+            .size = config.pool_size,
+            .connect = .{
+                .port = config.port,
+                .host = config.host,
+            },
+            .auth = .{
+                .username = config.username,
+                .database = config.database,
+                .password = config.password,
+                .timeout = config.timeout,
+            },
+        });
+        return .{ .pool = pool };
+    }
+
+    pub fn deinit(self: *Database) void {
+        self.pool.deinit();
+    }
+
+    /// Convenience: execute a query and return result
+    pub fn query(self: *Database, sql: []const u8, args: anytype) !pg.Result {
+        return self.pool.query(sql, args);
+    }
+
+    /// Convenience: execute a command (INSERT/UPDATE/DELETE)
+    pub fn exec(self: *Database, sql: []const u8, args: anytype) !?usize {
+        return self.pool.exec(sql, args);
+    }
+
+    /// Convenience: get a single row
+    pub fn row(self: *Database, sql: []const u8, args: anytype) !?pg.QueryRow {
+        return self.pool.row(sql, args);
+    }
+};
+```
+
+**Lifecycle integration:** Database is initialized in `main()` and passed to
+the server, which passes it to handlers via closures or a context struct.
+
+#### 13-4: User Repository (CRUD with Parameterized Queries)
+
+**File:** `src/http/user_repository.zig`
+
+**What:** Type-safe CRUD operations for the `users` table. Every query uses
+`$1`, `$2` parameterized placeholders.
+
+**Design:**
+```zig
+pub const User = struct {
+    id: i32,
+    name: []const u8,
+    email: []const u8,
+    age: ?i32 = null,
+};
+
+pub const CreateUserInput = struct {
+    name: []const u8,
+    email: []const u8,
+    age: ?i32 = null,
+};
+
+pub const UserRepository = struct {
+    db: *Database,
+
+    pub fn getAll(self: *UserRepository) !pg.Result {
+        return self.db.query(
+            "SELECT id, name, email, age FROM users ORDER BY id",
+            .{},
+        );
+    }
+
+    pub fn getById(self: *UserRepository, id: i32) !?User {
+        var query_row = try self.db.row(
+            "SELECT id, name, email, age FROM users WHERE id = $1",
+            .{id},
+        ) orelse return null;
+        defer query_row.deinit() catch {};
+        return query_row.to(User, .{}) catch return null;
+    }
+
+    pub fn create(self: *UserRepository, input: CreateUserInput) !?User {
+        var query_row = try self.db.row(
+            "INSERT INTO users (name, email, age) VALUES ($1, $2, $3) RETURNING id, name, email, age",
+            .{ input.name, input.email, input.age },
+        ) orelse return null;
+        defer query_row.deinit() catch {};
+        return query_row.to(User, .{}) catch return null;
+    }
+
+    pub fn update(self: *UserRepository, id: i32, input: CreateUserInput) !?User {
+        var query_row = try self.db.row(
+            "UPDATE users SET name = $1, email = $2, age = $3 WHERE id = $4 RETURNING id, name, email, age",
+            .{ input.name, input.email, input.age, id },
+        ) orelse return null;
+        defer query_row.deinit() catch {};
+        return query_row.to(User, .{}) catch return null;
+    }
+
+    pub fn delete(self: *UserRepository, id: i32) !bool {
+        const affected = try self.db.exec(
+            "DELETE FROM users WHERE id = $1",
+            .{id},
+        );
+        return (affected orelse 0) > 0;
+    }
+};
+```
+
+**SQL Injection Safety:**
+- Every SQL string is a compile-time literal — no runtime string building
+- All user data flows through `$1`, `$2`, ... parameters
+- pg.zig sends parameters via PostgreSQL's binary protocol
+- Type checking at bind time (e.g., passing a string where `i32` expected → error)
+
+#### 13-5: REST API Handlers (JSON + DB)
+
+**File:** `src/http_server_main.zig` (new routes + handlers)
+
+**New routes:**
+```
+GET    /api/users       → listUsers    (returns JSON array)
+GET    /api/users/:id   → getUser      (returns JSON object or 404)
+POST   /api/users       → createUser   (JSON body → DB → 201 JSON)
+PUT    /api/users/:id   → updateUser   (JSON body → DB → 200 JSON)
+DELETE /api/users/:id   → deleteUser   (DB → 204 No Content)
+```
+
+**Handler pattern:**
+```zig
+fn handleListUsers(request: *http.Request, response: *http.Response, io: std.Io) anyerror!void {
+    _ = io;
+    const repo = getUserRepo(request);  // get from request context
+    var result = try repo.getAll();
+    defer result.deinit();
+
+    var users = std.ArrayList(User).init(request.arena);
+    while (try result.next()) |row| {
+        try users.append(try row.to(User, .{ .allocator = request.arena }));
+    }
+    try response.sendJsonValue(.ok, users.items);
+}
+
+fn handleCreateUser(request: *http.Request, response: *http.Response, io: std.Io) anyerror!void {
+    _ = io;
+    const body = try request.readBody(io.reader());  // read from network
+    _ = body;
+    const input = try request.jsonBody(CreateUserInput);
+    const repo = getUserRepo(request);
+    if (try repo.create(input)) |user| {
+        try response.sendJsonValue(.created, user);
+    } else {
+        try response.sendJsonValue(.internal_server_error, .{ .@"error" = "Failed to create user" });
+    }
+}
+```
+
+**Context passing:** The `Database` / `UserRepository` needs to be accessible
+from handlers. Options:
+- **Option A:** Store `*Database` in a global/server-level context passed through
+  the router (requires modifying handler signature or router)
+- **Option B:** Use a closure that captures the database pointer
+- **Option C:** Thread-local or connection-level context
+
+We'll evaluate the best approach during implementation. The router currently
+passes `(request, response, io)` — we may need to add an `app_context` parameter
+or use the server's allocator to store the DB handle.
+
+#### 13-6: Integration Tests & Documentation
+
+**Status:** ✅ COMPLETE
+
+**Database Integration Tests** (`src/db_integration_test.zig`):
+
+| # | Test | What it verifies |
+|---|------|-----------------|
+| 1 | DB connection — acquire/release | Pool init succeeded, connections work |
+| 2 | List seed users (≥ 3) | Seed data from `init.sql` is present |
+| 3 | Create user → verify fields | INSERT RETURNING works, ID > 0, fields match |
+| 4 | Get user by ID → verify fields | SELECT WHERE id=$1, all columns correct |
+| 5 | List all users → count +1 | Row count increased after create |
+| 6 | Update user → verify changed | UPDATE RETURNING, name/email/age changed |
+| 7 | Get nonexistent user → null | SELECT with bad ID returns null (no crash) |
+| 8 | Delete user → verify removed | DELETE + subsequent GET returns null |
+| 9 | SQL injection → stored literally | `'; DROP TABLE users; --` stored as string, table intact |
+| 10 | Unique constraint → error/null | Duplicate email INSERT rejected by UNIQUE constraint |
+
+**Run:** `zig build db-integration-test` (requires `cd docker && docker compose up -d`)
+
+**File reorganization:** Moved database files from `src/http/` to `src/db/`:
+- `src/db/db.zig` — module root, re-exports `Database` + `UserRepository`
+- `src/db/database.zig` — `pg.Pool` wrapper with `Config` struct
+- `src/db/user_repository.zig` — type-safe CRUD for `users` table
+- `src/root.zig` — now exports both `http` and `db` modules
+- `src/http_server_main.zig` — imports `db` module separately from `http`
+
+**Documentation updates:**
+- `docs/ARCHITECTURE.md` — Added DB layer to system diagram, updated module dependency graph and file layout
+- `docs/PERFORMANCE.md` — Added Section 15: Connection Pool Performance
+- `BUILD_AND_RUN.md` — Added Docker setup instructions, `--no-db` flag, `db-integration-test` command
+
+### File Plan
+
+| File | Action | Description |
+|------|--------|-------------|
+| `build.zig.zon` | MODIFY | Add pg.zig dependency |
+| `build.zig` | MODIFY | Wire pg module into executables + db-integration-test step |
+| `docker/compose.yml` | CREATE | PostgreSQL 16 container |
+| `docker/init.sql` | CREATE | Schema + seed data |
+| `src/db/db.zig` | CREATE | DB module root — re-exports Database + UserRepository |
+| `src/db/database.zig` | CREATE | Pool wrapper + config |
+| `src/db/user_repository.zig` | CREATE | Type-safe CRUD operations |
+| `src/root.zig` | MODIFY | Export db module |
+| `src/http/http.zig` | MODIFY | Remove DB exports (moved to src/db/) |
+| `src/http_server_main.zig` | MODIFY | Add REST routes + handlers, import db module |
+| `src/db_integration_test.zig` | CREATE | 10 DB integration tests (requires PostgreSQL) |
+| `docs/PERFORMANCE.md` | MODIFY | Section 15: Connection pool performance |
+| `docs/ARCHITECTURE.md` | MODIFY | DB layer diagram + module dependency graph |
+| `BUILD_AND_RUN.md` | MODIFY | Docker instructions + db-integration-test docs |
+
+### Performance Considerations
+
+| Aspect | Strategy |
+|--------|----------|
+| Connection reuse | `pg.Pool` keeps N connections open (default 10) |
+| Query overhead | Parameterized queries: Parse → Bind → Execute (3 round-trips, cacheable) |
+| Cached prepared stmts | `cache_name` option skips Parse+Describe after first execution |
+| Row mapping | `row.to(T, .{})` is zero-alloc for scalar fields; strings need `.dupe = true` or arena allocator |
+| Memory | Pass request arena to `queryOpts(.{.allocator = arena})` — all query results freed in one O(1) reset |
+| Pooling thread-safety | `pg.Pool.acquire/release` are thread-safe — safe for concurrent handlers |
+| Reconnection | Pool runs background thread to reconnect failed connections automatically |

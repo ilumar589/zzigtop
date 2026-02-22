@@ -15,59 +15,56 @@ A from-scratch HTTP/1.1 server built in Zig 0.16, designed to maximize performan
 ┌─────────────────────────────────────────────────┐
 │                  Main Entry Point               │
 │           (src/http_server_main.zig)             │
-│  - Parses CLI args (port)                       │
+│  - Parses CLI args (port, --no-db, etc.)        │
 │  - Receives Io instance from process.Init       │
+│  - Initializes Database (optional)              │
 │  - Starts the Server                            │
 └───────────────────┬─────────────────────────────┘
                     │
-┌───────────────────▼─────────────────────────────┐
-│              Server (server.zig)                 │
-│  - Binds to address via std.Io.net.listen()     │
-│  - Accept loop with Io.Group async dispatch     │
-│  - Each connection = async task (fiber/thread)  │
-│  - Auto-scaled by Io runtime                    │
-└───────────────────┬─────────────────────────────┘
-                    │ Io.Group.async()
-┌───────────────────▼─────────────────────────────┐
-│         Connection (connection.zig)              │
-│  - handleAsync(): Io.Group-compatible entry     │
-│  - Per-connection arena (fiber-safe)            │
-│  - Wraps std.http.Server for HTTP parsing       │
-│  - Keep-alive loop (multiple requests/conn)     │
-│  - Arena reset with .retain_capacity per req    │
-│  - Buffered I/O with stack-allocated buffers    │
-└───────────────────┬─────────────────────────────┘
-                    │ (per request)
-┌───────────────────▼─────────────────────────────┐
-│            Router (router.zig)                   │
-│  - Comptime route table generation              │
-│  - Path parameter extraction                    │
-│  - Method-based dispatch                        │
-│  - O(routes) matching with early exit           │
-└───────────────────┬─────────────────────────────┘
-                    │
-┌───────────────────▼─────────────────────────────┐
-│        Request / Response Layer                  │
-│  request.zig:                                    │
-│  - Zero-copy header access                      │
-│  - Arena allocator per request                  │
-│  response.zig:                                   │
-│  - Vectored writes (header + body combined)     │
-│  - Comptime status line generation              │
-│  - Content-Length auto-calculation              │
-└─────────────────────────────────────────────────┘
+        ┌───────────┴───────────┐
+        │                       │
+┌───────▼───────────────────┐ ┌─▼──────────────────────────────┐
+│   Server (server.zig)     │ │  Database Layer (src/db/)      │
+│  - TCP accept loop        │ │  database.zig — Pool wrapper   │
+│  - Io.Group async dispatch│ │  user_repository.zig — CRUD    │
+│  - Auto-scaled workers    │ │  Uses pg.zig (zigster64 fork)  │
+└───────────┬───────────────┘ │  Binary protocol ($1,$2,...)   │
+            │ Io.Group.async()│  Parameterized query safety    │
+┌───────────▼───────────────┐ └─▲──────────────────────────────┘
+│  Connection (connection)  │   │ handlers call UserRepository
+│  - Per-connection arena   │   │
+│  - HTTP parsing           │───┘
+│  - Keep-alive loop        │
+└───────────┬───────────────┘
+            │ (per request)
+┌───────────▼───────────────────────────────────────┐
+│            Router (router.zig)                     │
+│  - Comptime route table generation                │
+│  - Path parameter extraction (:id, :name)         │
+│  - Method-based dispatch                          │
+└───────────┬───────────────────────────────────────┘
+            │
+┌───────────▼───────────────────────────────────────┐
+│        Request / Response Layer                    │
+│  request.zig: Zero-copy headers, arena per req    │
+│  response.zig: Vectored writes, comptime status   │
+└───────────────────────────────────────────────────┘
 ```
 
 ## Module Dependency Graph
 
 ```
-http.zig (module root)
-├── server.zig      → connection.zig, router.zig
-├── connection.zig  → request.zig, response.zig, router.zig, parser.zig
-├── router.zig      → request.zig, response.zig
-├── request.zig     → parser.zig
-├── response.zig    → (std.http only)
-└── parser.zig      → (std.http, SIMD)
+root.zig (package root)
+├── http.zig (HTTP module root)
+│   ├── server.zig      → connection.zig, router.zig
+│   ├── connection.zig  → request.zig, response.zig, router.zig, parser.zig
+│   ├── router.zig      → request.zig, response.zig
+│   ├── request.zig     → parser.zig
+│   ├── response.zig    → (std.http only)
+│   └── parser.zig      → (std.http, SIMD)
+└── db.zig (Database module root)
+    ├── database.zig    → pg.zig (connection pool wrapper)
+    └── user_repository.zig → database.zig, pg.zig
 ```
 
 ## Key Design Decisions
@@ -105,12 +102,28 @@ Routes are defined at compile time. The compiler generates an optimized matching
 ### 6. Vectored Writes
 Response status line + headers + body are combined into a single vectored write syscall, reducing system call overhead.
 
+### 7. Database Layer Separation
+The database module (`src/db/`) is completely independent of the HTTP module. This enables:
+- **Reusability:** CLI tools, migrations, or batch jobs can use `Database` + `UserRepository` without the HTTP server.
+- **Testability:** DB integration tests run directly against PostgreSQL without starting an HTTP server.
+- **SQL injection safety at the protocol level:** All queries use PostgreSQL's parameterized query protocol (`$1`, `$2`, ...). User data is never interpolated into SQL strings — it travels via the binary wire protocol.
+
+### 8. Connection Pool (pg.zig)
+Uses `zigster64/pg.zig#zig16` — a Zig 0.16 compatible fork of `karlseguin/pg.zig`. The pool manages a fixed number of connections and handles reconnection automatically.
+- Pool size configurable (default: 5)
+- Timeout via `Io.Duration` (async-aware)
+- Connections returned to pool on `Result.deinit()` or explicit `release()`
+
 ## File Layout
 
 ```
 src/
+├── db/
+│   ├── db.zig            — Database module root, re-exports types
+│   ├── database.zig      — pg.Pool wrapper with Config struct
+│   └── user_repository.zig — Type-safe CRUD for users table
 ├── http/
-│   ├── http.zig          — Module root, re-exports all public types
+│   ├── http.zig          — HTTP module root, re-exports all public types
 │   ├── server.zig        — TCP accept loop, Io.Group async dispatch
 │   ├── connection.zig    — Per-connection HTTP handling, keep-alive
 │   ├── router.zig        — Comptime route table, path matching
@@ -118,16 +131,22 @@ src/
 │   ├── response.zig      — HTTP response builder with vectored writes
 │   ├── parser.zig        — SIMD-accelerated HTTP parsing utilities
 │   └── thread_pool.zig   — Legacy fixed-size thread pool (superseded)
-├── http_server_main.zig  — Executable entry point
+├── http_server_main.zig  — Executable entry point (HTTP server + REST API)
+├── db_integration_test.zig — Database integration tests (requires PostgreSQL)
+├── integration_test.zig  — HTTP integration tests
+├── benchmark.zig         — Performance benchmarks
 ├── main.zig              — Original learn-zig entry point
-└── root.zig              — Library root
+└── root.zig              — Library root (exports http + db modules)
+docker/
+├── compose.yml           — PostgreSQL 16 container definition
+└── init.sql              — Schema + seed data (auto-runs on first up)
 docs/
 ├── PROGRESS.md           — Step-by-step progress tracker
 ├── ARCHITECTURE.md       — This file
 ├── PERFORMANCE.md        — Performance techniques reference
 └── API.md                — API documentation
 build.zig                 — Build configuration
-build.zig.zon             — Package metadata
+build.zig.zon             — Package metadata (includes pg.zig dependency)
 ```
 
 ## Threading Model

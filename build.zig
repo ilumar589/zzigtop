@@ -28,6 +28,13 @@ pub fn build(b: *std.Build) void {
     // to our consumers. We must give it a name because a Zig package can expose
     // multiple modules and consumers will need to be able to specify which
     // module they want to access.
+    // ---- pg.zig dependency (PostgreSQL driver) ----
+    const pg_dep = b.dependency("pg", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const pg_module = pg_dep.module("pg");
+
     const mod = b.addModule("learn_zig", .{
         // The root source file is the "entry point" of this module. Users of
         // this module will only be able to access public declarations contained
@@ -39,6 +46,9 @@ pub fn build(b: *std.Build) void {
         // Later on we'll use this module as the root module of a test executable
         // which requires us to specify a target.
         .target = target,
+        .imports = &.{
+            .{ .name = "pg", .module = pg_module },
+        },
     });
 
     // Here we define an executable. An executable needs to have a root module
@@ -98,6 +108,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "learn_zig", .module = mod },
+                .{ .name = "pg", .module = pg_module },
             },
         }),
     });
@@ -156,6 +167,25 @@ pub fn build(b: *std.Build) void {
     const run_integration_test_cmd = b.addRunArtifact(integration_test_exe);
     run_integration_test_step.dependOn(&run_integration_test_cmd.step);
     run_integration_test_cmd.step.dependOn(b.getInstallStep());
+
+    // ---- Database Integration Test Executable ----
+    const db_integration_test_exe = b.addExecutable(.{
+        .name = "db_integration_test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/db_integration_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "learn_zig", .module = mod },
+            },
+        }),
+    });
+    b.installArtifact(db_integration_test_exe);
+
+    const run_db_integration_test_step = b.step("db-integration-test", "Run database integration tests (requires PostgreSQL)");
+    const run_db_integration_test_cmd = b.addRunArtifact(db_integration_test_exe);
+    run_db_integration_test_step.dependOn(&run_db_integration_test_cmd.step);
+    run_db_integration_test_cmd.step.dependOn(b.getInstallStep());
 
     // ---- Benchmark Executable ----
     const benchmark_exe = b.addExecutable(.{

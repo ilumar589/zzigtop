@@ -56,6 +56,9 @@
 # Run the server on a custom port
 .\run.ps1 -Server -Optimize ReleaseFast -- --port 3000
 
+# Run the server without database (skip PostgreSQL)
+.\run.ps1 -Server -- --no-db
+
 # Run the server with a specific thread pool size
 .\run.ps1 -Server -Optimize ReleaseFast -- --port 3000 --threads 8
 
@@ -97,6 +100,52 @@ zig build run-server
 
 # Build and run the HTTP server with max performance
 zig build run-server -Doptimize=ReleaseFast
+```
+
+---
+
+## PostgreSQL Setup (Docker)
+
+The server's REST API (`/api/users`) requires a PostgreSQL database. A Docker Compose file is provided for easy setup.
+
+### Prerequisites
+
+- [Docker Desktop](https://www.docker.com/products/docker-desktop/) installed and running
+
+### Start PostgreSQL
+
+```powershell
+cd docker
+docker compose up -d
+```
+
+This starts PostgreSQL 16 on port **5432** with:
+- Database: `ziglearn`
+- Username: `ziglearn`
+- Password: `ziglearn`
+- Seed data: 3 users (Alice, Bob, Charlie)
+
+### Verify
+
+```powershell
+docker compose ps          # Should show "healthy"
+docker compose logs        # View PostgreSQL logs
+```
+
+### Stop / Reset
+
+```powershell
+docker compose down        # Stop container (data persists in volume)
+docker compose down -v     # Stop and delete volume (reset to seed data)
+```
+
+### Running Without a Database
+
+The HTTP server works without PostgreSQL — database endpoints return `503 Service Unavailable`:
+
+```powershell
+zig build run-server -- --no-db
+```
 
 # Pass arguments (e.g. custom port and thread count)
 zig build run-server -- --port 3000 --threads 8
@@ -120,33 +169,39 @@ powershell -ExecutionPolicy Bypass -File test.ps1 -Verbose
 # Run integration tests (starts server, sends real HTTP requests)
 powershell -ExecutionPolicy Bypass -File test.ps1 -Integration
 
+# Run database integration tests (requires PostgreSQL — see Docker Setup)
+powershell -ExecutionPolicy Bypass -File test.ps1 -DbIntegration
+
 # Run benchmarks (ReleaseFast, measures throughput & latency)
 powershell -ExecutionPolicy Bypass -File test.ps1 -Benchmark
 
-# Run everything: unit + integration + benchmark
+# Run everything: unit + integration + db-integration + benchmark
 powershell -ExecutionPolicy Bypass -File test.ps1 -All
 
 # Combine flags as needed
 powershell -ExecutionPolicy Bypass -File test.ps1 -Integration -Verbose
+powershell -ExecutionPolicy Bypass -File test.ps1 -Integration -DbIntegration
 ```
 
 ### Test Script Parameters
 
 | Parameter       | Description                                                    |
 |-----------------|----------------------------------------------------------------|
-| `-Verbose`      | List every individual test with `[PASS]` / `[FAIL]` markers   |
-| `-Integration`  | Run integration tests (end-to-end HTTP over TCP)               |
-| `-Benchmark`    | Run performance benchmarks (built with `-Doptimize=ReleaseFast`) |
-| `-All`          | Run all phases: unit tests, integration tests, and benchmarks  |
+| `-Verbose`        | List every individual test with `[PASS]` / `[FAIL]` markers     |
+| `-Integration`    | Run integration tests (end-to-end HTTP over TCP)                 |
+| `-DbIntegration`  | Run database integration tests (requires PostgreSQL via Docker)  |
+| `-Benchmark`      | Run performance benchmarks (built with `-Doptimize=ReleaseFast`) |
+| `-All`            | Run all phases: unit, integration, db-integration, and benchmark |
 
-With no flags, only unit tests are run.
+With no flags, only unit tests are run. Use `-DbIntegration` only when PostgreSQL is running.
 
 ### What Each Phase Tests
 
 | Phase         | Count | What it covers |
 |---------------|-------|----------------|
 | **Unit**      | 64    | Parser, router, request, response — pure logic, no I/O |
-| **Integration** | 10  | Full HTTP request/response cycle over real TCP sockets |
+| **Integration** | 16  | Full HTTP request/response cycle over real TCP sockets |
+| **DB Integration** | 10 | CRUD, constraints, SQL injection safety (requires PostgreSQL) |
 | **Benchmark** | 6     | Throughput & latency: conn-per-req + keep-alive (ReleaseFast) |
 
 ### Zig Build Commands (without test.ps1)
@@ -160,6 +215,9 @@ zig build test --summary all
 
 # Run integration tests (starts server, sends HTTP requests, validates responses)
 zig build integration-test
+
+# Run database integration tests (requires PostgreSQL — see Docker Setup above)
+zig build db-integration-test
 
 # Run benchmarks (use ReleaseFast for meaningful numbers)
 zig build benchmark -Doptimize=ReleaseFast
