@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Zig HTTP Server</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <!-- htmx — loaded from CDN for now, will be local in Step 16 -->
+    <script src="https://unpkg.com/htmx.org@2.0.4"></script>
+</head>
+<body>
+    <header>
+        <h1>⚡ Zig HTTP/1 Server</h1>
+        <p class="subtitle">High-performance server built from scratch in Zig 0.16</p>
+    </header>
+
+    <main>
+        <section class="card">
+            <h2>Server Info</h2>
+            <dl>
+                <dt>Language</dt>
+                <dd>Zig 0.16</dd>
+                <dt>I/O Model</dt>
+                <dd>Async (Io.Group work-stealing)</dd>
+                <dt>Parsing</dt>
+                <dd>SIMD-accelerated, zero-copy</dd>
+                <dt>Routing</dt>
+                <dd>Comptime route table</dd>
+            </dl>
+        </section>
+
+        <section class="card">
+            <h2>Live Metrics</h2>
+            <!-- htmx: poll server metrics every 2 seconds (Step 16 will enhance this) -->
+            <div id="metrics" hx-get="/metrics" hx-trigger="load, every 2s" hx-swap="innerHTML">
+                <p class="loading">Loading metrics...</p>
+            </div>
+        </section>
+
+        <section class="card">
+            <h2>API Routes</h2>
+            <table>
+                <thead>
+                    <tr><th>Method</th><th>Path</th><th>Description</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td class="method get">GET</td><td><code>/</code></td><td>This page (static)</td></tr>
+                    <tr><td class="method get">GET</td><td><code>/health</code></td><td>Health check</td></tr>
+                    <tr><td class="method get">GET</td><td><code>/hello/:name</code></td><td>Greeting</td></tr>
+                    <tr><td class="method post">POST</td><td><code>/echo</code></td><td>Echo request</td></tr>
+                    <tr><td class="method post">POST</td><td><code>/api/echo-json</code></td><td>JSON echo</td></tr>
+                    <tr><td class="method get">GET</td><td><code>/dashboard/:id</code></td><td>Concurrent fan-out</td></tr>
+                    <tr><td class="method get">GET</td><td><code>/metrics</code></td><td>Server statistics</td></tr>
+                    <tr><td class="method get">GET</td><td><code>/api/users</code></td><td>List users</td></tr>
+                    <tr><td class="method post">POST</td><td><code>/api/users</code></td><td>Create user</td></tr>
+                </tbody>
+            </table>
+        </section>
+    </main>
+
+    <footer>
+        <p>Served by <strong>Zig HTTP/1 Server</strong> &mdash; static files from <code>public/</code></p>
+    </footer>
+
+    <script src="/js/app.js"></script>
+</body>
+</html>

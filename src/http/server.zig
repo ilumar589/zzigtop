@@ -22,6 +22,7 @@ const mem = std.mem;
 
 const Router = @import("router.zig");
 const Connection = @import("connection.zig");
+const Static = @import("static.zig");
 
 const Server = @This();
 
@@ -61,6 +62,10 @@ pub const Config = struct {
     /// Interval for metrics reporter logging (seconds).
     /// 0 = disable metrics reporter. Default: 10s.
     metrics_interval_s: u32 = 10,
+    /// Static file serving configuration.
+    /// When set, unmatched routes fall back to serving files from this directory.
+    /// null = disable static file serving (unmatched routes return 404).
+    static_config: ?Static.Config = null,
 };
 
 /// The underlying TCP server.
@@ -75,6 +80,8 @@ idle_timeout_s: u32,
 request_timeout_s: u32,
 /// Metrics reporter interval in seconds (0 = disabled).
 metrics_interval_s: u32,
+/// Static file serving configuration (null = disabled).
+static_config: ?Static.Config,
 /// Atomic server statistics (shared with connections).
 stats: Stats = .{},
 
@@ -103,6 +110,7 @@ pub fn start(allocator: std.mem.Allocator, io: Io, config: Config) !Server {
         .idle_timeout_s = config.idle_timeout_s,
         .request_timeout_s = config.request_timeout_s,
         .metrics_interval_s = config.metrics_interval_s,
+        .static_config = config.static_config,
     };
 }
 
@@ -157,7 +165,7 @@ pub fn run(self: *Server, io: Io) Io.Cancelable!void {
         // The Io runtime decides whether to run it on a fiber,
         // a pooled thread, or inline (if resources exhausted).
         _ = self.stats.total_connections.fetchAdd(1, .monotonic);
-        group.async(io, Connection.handleAsync, .{ stream, io, self.router, self.allocator, self.idle_timeout_s, self.request_timeout_s, &self.stats });
+        group.async(io, Connection.handleAsync, .{ stream, io, self.router, self.allocator, self.idle_timeout_s, self.request_timeout_s, &self.stats, self.static_config });
     }
 
     // At this point, the accept loop has exited (shutdown requested).

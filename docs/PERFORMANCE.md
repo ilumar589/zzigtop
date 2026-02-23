@@ -582,6 +582,52 @@ I/O fibers remain available to accept and serve lightweight requests.
 
 ---
 
+## 18. Static File Serving (Zero-Cost Fallback)
+
+**Files:** `static.zig`, `connection.zig`, `response.zig`
+
+**What:** Static files (HTML, CSS, JS, images) are served from a configurable
+document root directory when no comptime route matches a request.
+
+**Why this is fast:**
+
+1. **Zero route overhead:** Static file lookup only happens when `Router.dispatch()`
+   returns null. API routes never pay any static-file cost.
+
+2. **Comptime MIME table:** Extension-to-Content-Type mapping is a comptime array
+   with `inline for`. The compiler generates an optimal comparison chain — no
+   hash table, no heap allocations, no runtime initialization.
+
+   ```zig
+   inline for (mime_table) |entry| {
+       if (eqlIgnoreCaseComptime(ext, entry.ext)) return entry.content_type;
+   }
+   ```
+
+3. **Page-allocated reads:** File contents are read via `std.heap.page_allocator`,
+   freed immediately after `response.flush()` writes data to the socket. This
+   avoids arena fragmentation (large file buffers won't fragment the per-request
+   arena) while keeping memory bounded.
+
+4. **O(n) path validation:** Path sanitization is a single linear scan — no regex,
+   no allocations. Rejects `..` traversal, null bytes, and backslashes.
+
+5. **Bounded file size:** `max_file_size` (default 10MB) prevents accidental
+   serving of huge files that would exhaust memory.
+
+6. **Cache-Control headers:** `Cache-Control: public, max-age=3600` tells browsers
+   to cache assets, reducing repeat requests to zero server work.
+
+7. **Io-native file I/O:** Uses `Io.Dir`/`Io.File` APIs (`openDir`, `openFile`,
+   `readPositionalAll`, `stat`) which go through the Zig I/O runtime. On evented
+   backends, file reads can yield to serve other connections.
+
+**Cost when NOT used:** `static_config: null` (the default) — the fallback is a
+single `if (static_config) |sc|` branch per unmatched request. Zero overhead
+for servers that only serve API routes.
+
+---
+
 ## Techniques NOT Used (and Why)
 
 ### io_uring / IOCP

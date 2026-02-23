@@ -4,6 +4,8 @@
 //!   zig build run-server                             # Debug, port 8080
 //!   zig build run-server -Doptimize=ReleaseFast      # Max performance
 //!   zig build run-server -- --port 3000               # Custom port
+//!   zig build run-server -- --static-dir assets       # Custom static root
+//!   zig build run-server -- --no-static               # Disable static files
 
 const std = @import("std");
 const http = @import("learn_zig").http;
@@ -44,6 +46,8 @@ pub fn main(init: std.process.Init) !void {
     var no_db = false;
     var db_host: []const u8 = "127.0.0.1";
     var db_port: u16 = 5432;
+    var static_dir: []const u8 = "public";
+    var no_static = false;
     const args = try init.minimal.args.toSlice(arena);
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -52,6 +56,11 @@ pub fn main(init: std.process.Init) !void {
             i += 1;
         } else if (std.mem.eql(u8, args[i], "--no-db")) {
             no_db = true;
+        } else if (std.mem.eql(u8, args[i], "--no-static")) {
+            no_static = true;
+        } else if (std.mem.eql(u8, args[i], "--static-dir") and i + 1 < args.len) {
+            static_dir = args[i + 1];
+            i += 1;
         } else if (std.mem.eql(u8, args[i], "--db-host") and i + 1 < args.len) {
             db_host = args[i + 1];
             i += 1;
@@ -80,6 +89,7 @@ pub fn main(init: std.process.Init) !void {
 
     // ---- Start server ----
     const db_status: []const u8 = if (database != null) "connected" else "disabled";
+    const static_status: []const u8 = if (no_static) "disabled" else static_dir;
     std.debug.print(
         \\
         \\  +--------------------------------------------+
@@ -87,16 +97,22 @@ pub fn main(init: std.process.Init) !void {
         \\  |   Listening on http://127.0.0.1:{d:<5}      |
         \\  |   Async I/O pool (auto-scaled)             |
         \\  |   Database: {s:<20}          |
+        \\  |   Static:   {s:<20}          |
         \\  |   Press Ctrl+C to stop                     |
         \\  +--------------------------------------------+
         \\
         \\
-    , .{ port, db_status });
+    , .{ port, db_status, static_status });
+
+    const static_config: ?http.Static.Config = if (no_static) null else .{
+        .root_dir = static_dir,
+    };
 
     var server = try http.Server.start(init.gpa, io, .{
         .port = port,
         .router = &router,
         .reuse_address = true,
+        .static_config = static_config,
     });
     defer server.deinit(io);
     defer if (database != null) {

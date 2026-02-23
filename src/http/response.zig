@@ -13,6 +13,7 @@ const Io = std.Io;
 const json = std.json;
 
 const Response = @This();
+const Static = @import("static.zig");
 
 /// The underlying writer to the client socket.
 writer: *Io.Writer,
@@ -152,6 +153,28 @@ pub fn sendJsonValue(self: *Response, status: http.Status, value: anytype) !void
     self.body = body;
     try self.addHeader("content-type", "application/json; charset=utf-8");
     try self.flush();
+}
+
+/// Send an HTML response.
+pub fn sendHtml(self: *Response, status: http.Status, body: []const u8) !void {
+    self.status = status;
+    self.body = body;
+    try self.addHeader("content-type", "text/html; charset=utf-8");
+    try self.flush();
+}
+
+/// Try to serve a static file for the given request path.
+///
+/// Returns true if the file was found and served, false otherwise.
+/// On false, the caller should send a 404 or other error response.
+///
+/// Example:
+///   if (!try response.sendStaticFile(static_config, request.path)) {
+///       try response.sendText(.not_found, "Not Found");
+///   }
+pub fn sendStaticFile(self: *Response, config: Static.Config, request_path: []const u8, io: Io) bool {
+    const result = Static.serve(config, request_path, self, io);
+    return result == .ok;
 }
 
 // ---- Tests ----

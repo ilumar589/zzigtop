@@ -24,6 +24,7 @@ const Io = std.Io;
 const Request = @import("request.zig");
 const Response = @import("response.zig");
 const Router = @import("router.zig");
+const Static = @import("static.zig");
 
 const Connection = @This();
 const Server = @import("server.zig");
@@ -57,6 +58,7 @@ pub fn handleAsync(
     idle_timeout_s: u32,
     request_timeout_s: u32,
     stats: ?*Server.Stats,
+    static_config: ?Static.Config,
 ) Io.Cancelable!void {
     defer stream.close(io);
     // Track active connections.
@@ -68,7 +70,7 @@ pub fn handleAsync(
     var arena_state: std.heap.ArenaAllocator = .init(allocator);
     defer arena_state.deinit();
 
-    handleInner(&arena_state, stream, io, router, idle_timeout_s, request_timeout_s, stats);
+    handleInner(&arena_state, stream, io, router, idle_timeout_s, request_timeout_s, stats, static_config);
 }
 
 /// Synchronous entry point — for direct use without Io.Group.
@@ -84,7 +86,7 @@ pub fn handle(
     request_timeout_s: u32,
 ) void {
     defer stream.close(io);
-    handleInner(arena_state, stream, io, router, idle_timeout_s, request_timeout_s, null);
+    handleInner(arena_state, stream, io, router, idle_timeout_s, request_timeout_s, null, null);
 }
 
 /// Core keep-alive loop (shared by async and sync entry points).
@@ -104,6 +106,7 @@ fn handleInner(
     idle_timeout_s: u32,
     request_timeout_s: u32,
     stats: ?*Server.Stats,
+    static_config: ?Static.Config,
 ) void {
     // Stack-allocated I/O buffers — no heap allocation for connection I/O.
     var read_buffer: [8192]u8 = undefined;
@@ -176,7 +179,22 @@ fn handleInner(
                 .timeout, .canceled => break,
             }
         } else {
-            // No route matched — 404 Not Found.
+            // No route matched — try static file serving if configured.
+            if (static_config) |sc| {
+                var response = Response.init(
+                    &stream_writer.interface,
+                    arena,
+                    request.keep_alive,
+                    request.version,
+                );
+                if (response.sendStaticFile(sc, request.path, io)) {
+                    // Static file served successfully.
+                    if (!request.keep_alive) break;
+                    continue;
+                }
+            }
+
+            // No route and no static file — 404 Not Found.
             http_request.respond("Not Found", .{
                 .status = .not_found,
                 .keep_alive = request.keep_alive,

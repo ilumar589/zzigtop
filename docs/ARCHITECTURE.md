@@ -56,11 +56,12 @@ A from-scratch HTTP/1.1 server built in Zig 0.16, designed to maximize performan
 ```
 root.zig (package root)
 ├── http.zig (HTTP module root)
-│   ├── server.zig      → connection.zig, router.zig
-│   ├── connection.zig  → request.zig, response.zig, router.zig, parser.zig
+│   ├── server.zig      → connection.zig, router.zig, static.zig
+│   ├── connection.zig  → request.zig, response.zig, router.zig, parser.zig, static.zig
 │   ├── router.zig      → request.zig, response.zig
 │   ├── request.zig     → parser.zig
-│   ├── response.zig    → (std.http only)
+│   ├── response.zig    → static.zig
+│   ├── static.zig      → response.zig (MIME types, file I/O, path security)
 │   └── parser.zig      → (std.http, SIMD)
 └── db.zig (Database module root)
     ├── database.zig    → pg.zig (connection pool wrapper)
@@ -147,6 +148,7 @@ src/
 │   ├── request.zig       — HTTP request wrapper with arena
 │   ├── response.zig      — HTTP response builder with vectored writes
 │   ├── parser.zig        — SIMD-accelerated HTTP parsing utilities
+│   ├── static.zig        — Static file handler (MIME types, path security, Io.Dir)
 │   ├── thread_pool.zig   — CPU-bound task pool (FixedBufferAllocator workers)
 ├── http_server_main.zig  — Executable entry point (HTTP server + REST API)
 ├── db_integration_test.zig — Database integration tests (requires PostgreSQL)
@@ -231,7 +233,13 @@ Per-CPU-Worker (pre-allocated, reused forever):
 2. **Buffer:** Create stack-allocated read/write buffers
 3. **Read:** `std.http.Server.receiveHead()` reads and parses HTTP head
 4. **Route:** `Router.dispatch()` matches path → handler at comptime-generated table
-5. **Handle:** Handler receives `Request`, writes to `Response` 
-6. **Write:** `Response.send()` flushes vectored buffers to socket
-7. **Keep-alive:** If Connection: keep-alive, loop back to step 3
-8. **Close:** Stream is closed, thread exits
+5. **Static fallback:** If no route matches and `static_config` is set, try `Static.serve()`
+   - Sanitize path (reject `../`, null bytes, backslashes)
+   - Open file via `Io.Dir.cwd()` → `dir.openDir(io)` → `dir.openFile(io)`
+   - Read via `file.readPositionalAll(io)` into page-allocated buffer
+   - Send with correct Content-Type (comptime MIME table) + Cache-Control
+   - Free page buffer after flush
+6. **Handle:** Handler receives `Request`, writes to `Response` 
+7. **Write:** `Response.send()` flushes vectored buffers to socket
+8. **Keep-alive:** If Connection: keep-alive, loop back to step 3
+9. **Close:** Stream is closed, thread exits

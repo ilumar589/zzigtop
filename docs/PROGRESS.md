@@ -4,7 +4,7 @@
 
 > **Last Updated:** 2026-02-22  
 > **Zig Version:** 0.16.0-dev.2535+b5bd49460  
-> **Status:** STEP 14 COMPLETE — CPU work pool + FixedBufferAllocator
+> **Status:** STEP 15 COMPLETE — Static file serving
 
 ---
 
@@ -48,6 +48,14 @@
 | | 14-2: FixedBufferAllocator per worker (bounded scratch space) | ✅ COMPLETE |
 | | 14-3: Export CpuPool from http module | ✅ COMPLETE |
 | | 14-4: Documentation (PERFORMANCE.md, ARCHITECTURE.md) | ✅ COMPLETE |
+| 15 | Static file serving | 🔧 IN PROGRESS |
+| | 15-1: `static.zig` — MIME mapping + path traversal prevention | ⬜ NOT STARTED |
+| | 15-2: `sendFile()` on Response — serve file with Content-Type | ⬜ NOT STARTED |
+| | 15-3: `static_dir` config on Server — configurable document root | ⬜ NOT STARTED |
+| | 15-4: Connection fallback — try static file when no route matches | ⬜ NOT STARTED |
+| | 15-5: Sample `public/` directory — HTML, CSS, JS demo files | ⬜ NOT STARTED |
+| | 15-6: Wire into `http_server_main.zig` | ⬜ NOT STARTED |
+| | 15-7: Integration tests + documentation | ⬜ NOT STARTED |
 
 ---
 
@@ -1437,3 +1445,104 @@ or use the server's allocator to store the DB handle.
 | Memory | Pass request arena to `queryOpts(.{.allocator = arena})` — all query results freed in one O(1) reset |
 | Pooling thread-safety | `pg.Pool.acquire/release` are thread-safe — safe for concurrent handlers |
 | Reconnection | Pool runs background thread to reconnect failed connections automatically |
+
+---
+
+## Step 15: Static File Serving ✅
+
+**Goal:** Serve static files (HTML, CSS, JS, images, etc.) from a configurable directory.
+This lays the groundwork for Step 16's htmx integration and HTML template rendering.
+
+### Architecture
+
+When a request doesn't match any comptime route, the server falls back to the
+static file handler. This tries to map the URL path to a file on disk:
+
+```
+Request: GET /style.css HTTP/1.1
+         │
+         ▼
+  ┌─── Router.dispatch() ──→ null (no route matched)
+  │
+  ▼
+  ┌─── StaticFileHandler.serve() ──→ reads public/style.css from disk
+  │    ├── Path traversal check (reject ../ sequences)
+  │    ├── Map extension → MIME type (comptime table)
+  │    ├── Read file into arena (bounded by max_file_size)
+  │    └── Send response with Content-Type + Cache-Control
+  │
+  ▼
+  HTTP/1.1 200 OK
+  content-type: text/css; charset=utf-8
+  content-length: 1234
+  cache-control: public, max-age=3600
+```
+
+### Design Decisions
+
+1. **Fallback pattern (not a catch-all route):** Static files are served only when
+   no comptime route matches. This keeps the router fast — it never has to check
+   a wildcard pattern. The fallback is a simple function call in `connection.zig`.
+
+2. **MIME type table at comptime:** Extension → Content-Type mapping is a comptime
+   array. No hash table, no heap allocation. The compiler generates an optimal
+   comparison chain.
+
+3. **Path traversal prevention:** Request paths are sanitized before touching the
+   filesystem. Any `..` segments, null bytes, or backslashes are rejected with 400.
+   The resolved path must stay under the configured document root.
+
+4. **Page-allocated file reads:** File contents are read via `page_allocator`,
+   freed immediately after `response.flush()` writes them to the socket. This avoids
+   arena fragmentation for large files while keeping memory bounded.
+
+5. **Bounded file size:** A configurable `max_file_size` (default: 10MB) prevents
+   accidental serving of huge files that would exhaust memory.
+
+6. **`index.html` fallback:** When the path is a directory (e.g., `/` or `/about/`),
+   automatically try `index.html` in that directory.
+
+7. **Cache-Control header:** Static files include `Cache-Control: public, max-age=3600`
+   (configurable) so browsers cache assets without re-requesting.
+
+### Sub-Steps
+
+| Sub-Step | Description | Status |
+|----------|-------------|--------|
+| 15-1 | `static.zig` — MIME type mapping (comptime) + path traversal prevention | ✅ COMPLETE |
+| 15-2 | `sendStaticFile()` on `Response` — serve file content with correct Content-Type | ✅ COMPLETE |
+| 15-3 | `static_config` on `Server` — optional `Static.Config` with document root | ✅ COMPLETE |
+| 15-4 | Connection fallback — try static file when no route matches | ✅ COMPLETE |
+| 15-5 | Sample `public/` directory — HTML, CSS, JS demo files (htmx-ready) | ✅ COMPLETE |
+| 15-6 | Wire into `http_server_main.zig` — enable static serving + CLI flags | ✅ COMPLETE |
+| 15-7 | Unit tests (84/84 pass) + documentation | ✅ COMPLETE |
+
+### File Plan
+
+| File | Action | Description |
+|------|--------|-------------|
+| `src/http/static.zig` | CREATE | MIME type mapping, path sanitization, file reading, serve logic |
+| `src/http/response.zig` | MODIFY | Add `sendFile()` convenience method |
+| `src/http/http.zig` | MODIFY | Export `Static` module |
+| `src/http/server.zig` | MODIFY | Add `static_dir` to Config, store + forward to connections |
+| `src/http/connection.zig` | MODIFY | Add static fallback when no route matches |
+| `public/index.html` | CREATE | Sample HTML page (htmx-ready structure for Step 16) |
+| `public/css/style.css` | CREATE | Sample stylesheet |
+| `public/js/app.js` | CREATE | Sample JavaScript file |
+| `src/http_server_main.zig` | MODIFY | Pass `static_dir` in server config |
+| `src/integration_test.zig` | MODIFY | Add static file serving tests |
+| `docs/PROGRESS.md` | MODIFY | This plan + completion status |
+| `docs/ARCHITECTURE.md` | MODIFY | Static file serving in system diagram |
+| `docs/PERFORMANCE.md` | MODIFY | Section 18: Static file serving performance |
+
+### Performance Considerations
+
+| Aspect | Strategy |
+|--------|----------|
+| No route overhead | Static files only checked after router returns null — zero cost for API routes |
+| MIME lookup | Comptime table — no hash, no heap, compiler-optimized comparisons |
+| File reading | Arena-allocated — freed in bulk with request, no per-file malloc/free |
+| Path validation | O(n) scan for `..` segments — no regex, no allocation |
+| Caching | `Cache-Control` headers reduce repeat requests to zero server work |
+| Memory bounded | `max_file_size` prevents unbounded reads (default 10MB) |
+| Future: mmap | For large files, could memory-map instead of read (not in this step) |
