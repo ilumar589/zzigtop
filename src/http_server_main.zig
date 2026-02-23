@@ -8,8 +8,8 @@
 //!   zig build run-server -- --no-static               # Disable static files
 
 const std = @import("std");
-const http = @import("learn_zig").http;
-const db = @import("learn_zig").db;
+const http = @import("zzigtop").http;
+const db = @import("zzigtop").db;
 const pg = @import("pg");
 
 /// Comptime-defined routes — compiled into an optimized match table.

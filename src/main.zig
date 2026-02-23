@@ -1,4 +1,4 @@
-//! Default entry point for the learn-zig executable.
+//! Default entry point for the zzigtop executable.
 //!
 //! This is the original scaffolding entry point, not part of the HTTP server.
 //! The HTTP server uses `http_server_main.zig` instead (`zig build run-server`).
@@ -6,9 +6,9 @@
 const std = @import("std");
 const Io = std.Io;
 
-const learn_zig = @import("learn_zig");
+const zzigtop = @import("zzigtop");
 
-/// Default learn-zig entry point: prints a greeting and demonstrates CLI arg parsing.
+/// Default zzigtop entry point: prints a greeting and demonstrates CLI arg parsing.
 pub fn main(init: std.process.Init) !void {
     // Prints to stderr, unbuffered, ignoring potential errors.
     std.debug.print("All your {s} are belong to us.\n", .{"codebase"});
@@ -32,7 +32,7 @@ pub fn main(init: std.process.Init) !void {
     var stdout_file_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
     const stdout_writer = &stdout_file_writer.interface;
 
-    try learn_zig.printAnotherMessage(stdout_writer);
+    try zzigtop.printAnotherMessage(stdout_writer);
 
     try stdout_writer.flush(); // Don't forget to flush!
 }

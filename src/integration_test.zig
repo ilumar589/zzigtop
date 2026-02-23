@@ -9,7 +9,7 @@
 //! Run with: zig build integration-test
 
 const std = @import("std");
-const http = @import("learn_zig").http;
+const http = @import("zzigtop").http;
 const Io = std.Io;
 const net = Io.net;
 

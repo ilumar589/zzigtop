@@ -9,7 +9,7 @@
 
 ```zig
 const std = @import("std");
-const http = @import("learn_zig").http;
+const http = @import("zzigtop").http;
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;

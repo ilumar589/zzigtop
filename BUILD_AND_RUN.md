@@ -18,7 +18,7 @@
 | `-Optimize`   | Optimization mode: `Debug`, `ReleaseSafe`, `ReleaseFast`, `ReleaseSmall` | `Debug`   |
 | `-BuildOnly`  | Build without running the executable                     | off       |
 | `-Clean`      | Remove build artifacts before building                   | off       |
-| `-Server`     | Build and run the HTTP server instead of learn_zig       | off       |
+| `-Server`     | Build and run the HTTP server instead of zzigtop       | off       |
 | `<exe-args>`  | Arguments passed through to the executable               | none      |
 
 ### Examples
@@ -83,7 +83,7 @@
 The compiled executables are placed at:
 
 ```
-zig-out\bin\learn_zig.exe      # Default learn_zig app
+zig-out\bin\zzigtop.exe         # Default zzigtop app
 zig-out\bin\http_server.exe    # HTTP server
 ```
 

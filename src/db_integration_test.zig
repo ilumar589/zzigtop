@@ -11,7 +11,7 @@
 //! Each test cleans up after itself so the suite is idempotent.
 
 const std = @import("std");
-const learn = @import("learn_zig");
+const learn = @import("zzigtop");
 const db = learn.db;
 const Io = std.Io;
 

@@ -1125,7 +1125,7 @@ for reconnecting failed connections.
 
 **Commands:**
 ```powershell
-cd c:\Projects\Personal\learn-zig-main
+cd c:\Projects\Personal\zzigtop
 zig fetch --save git+https://github.com/karlseguin/pg.zig#master
 ```
 
@@ -1140,7 +1140,7 @@ const pg_module = b.dependency("pg", .{
 
 // Add to http_server_exe's imports:
 .imports = &.{
-    .{ .name = "learn_zig", .module = mod },
+    .{ .name = "zzigtop", .module = mod },
     .{ .name = "pg", .module = pg_module },
 },
 ```

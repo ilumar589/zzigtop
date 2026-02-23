@@ -1,5 +1,5 @@
 -- ============================================================================
--- Schema for learn-zig HTTP server (Step 13: PostgreSQL integration)
+-- Schema for zzigtop HTTP server (Step 13: PostgreSQL integration)
 -- ============================================================================
 -- This file runs automatically on first `docker compose up`.
 -- To re-run: `docker compose down -v` then `docker compose up -d`.

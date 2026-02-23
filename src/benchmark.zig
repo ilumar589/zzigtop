@@ -11,7 +11,7 @@
 //!   wrk -t4 -c100 -d10s http://127.0.0.1:8080/health
 
 const std = @import("std");
-const http = @import("learn_zig").http;
+const http = @import("zzigtop").http;
 const Io = std.Io;
 const net = Io.net;
 

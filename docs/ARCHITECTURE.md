@@ -159,7 +159,7 @@ src/
 ├── db_integration_test.zig — Database integration tests (requires PostgreSQL)
 ├── integration_test.zig  — HTTP integration tests
 ├── benchmark.zig         — Performance benchmarks
-├── main.zig              — Original learn-zig entry point
+├── main.zig              — Original zzigtop entry point
 └── root.zig              — Library root (exports http + db modules)
 docker/
 ├── compose.yml           — PostgreSQL 16 container definition

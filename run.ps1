@@ -18,7 +18,7 @@ $ProjectRoot = $PSScriptRoot
 if ($Server) {
     $ExePath = Join-Path $ProjectRoot "zig-out\bin\http_server.exe"
 } else {
-    $ExePath = Join-Path $ProjectRoot "zig-out\bin\learn_zig.exe"
+    $ExePath = Join-Path $ProjectRoot "zig-out\bin\zzigtop.exe"
 }
 
 # Clean build artifacts
