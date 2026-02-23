@@ -159,7 +159,7 @@ pub fn parseRequestLine(line: []const u8) ParseError!RequestLine {
 
     // Find path end (last space before version)
     const rest = line[method_end + 1 ..];
-    const path_end = mem.lastIndexOfScalar(u8, rest, ' ') orelse
+    const path_end = mem.findScalarLast(u8, rest, ' ') orelse
         return error.InvalidPath;
 
     const path = rest[0..path_end];

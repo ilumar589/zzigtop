@@ -73,15 +73,15 @@ pub fn sanitizePath(path: []const u8) ?[]const u8 {
     if (path[0] != '/') return null;
 
     // Reject null bytes anywhere in the path.
-    if (mem.indexOfScalar(u8, path, 0)) |_| return null;
+    if (mem.findScalar(u8, path, 0)) |_| return null;
 
     // Reject backslashes (Windows path separator injection).
-    if (mem.indexOfScalar(u8, path, '\\')) |_| return null;
+    if (mem.findScalar(u8, path, '\\')) |_| return null;
 
     // Strip query string and fragment.
-    const clean = if (mem.indexOfScalar(u8, path, '?')) |qi|
+    const clean = if (mem.findScalar(u8, path, '?')) |qi|
         path[0..qi]
-    else if (mem.indexOfScalar(u8, path, '#')) |fi|
+    else if (mem.findScalar(u8, path, '#')) |fi|
         path[0..fi]
     else
         path;
@@ -172,7 +172,7 @@ pub fn mimeType(filename: []const u8) []const u8 {
 /// Extract the file extension (without the dot) from a filename.
 /// Returns null if no extension is found.
 fn extension(filename: []const u8) ?[]const u8 {
-    const dot_pos = mem.lastIndexOfScalar(u8, filename, '.') orelse return null;
+    const dot_pos = mem.findScalarLast(u8, filename, '.') orelse return null;
     if (dot_pos + 1 >= filename.len) return null;
     return filename[dot_pos + 1 ..];
 }
