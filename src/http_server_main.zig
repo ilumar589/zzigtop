@@ -134,27 +134,11 @@ pub fn main(init: std.process.Init) !void {
 // Request Handlers
 // ============================================================================
 
-/// GET / — Welcome page
-fn handleIndex(_: *http.Request, response: *http.Response, _: std.Io) anyerror!void {
-    try response.sendText(.ok,
-        \\Welcome to the Zig HTTP/1 Server!
-        \\
-        \\Available routes:
-        \\  GET  /               - This page
-        \\  GET  /health         - Health check
-        \\  GET  /hello/:name    - Greeting
-        \\  POST /echo           - Echo request
-        \\  POST /api/echo-json  - JSON echo (parse & serialize)
-        \\  GET  /dashboard/:id  - Concurrent fan-out demo
-        \\  GET  /metrics        - Server statistics (JSON)
-        \\
-        \\REST API (requires PostgreSQL):
-        \\  GET    /api/users       - List all users
-        \\  GET    /api/users/:id   - Get user by ID
-        \\  POST   /api/users       - Create user (JSON body)
-        \\  PUT    /api/users/:id   - Update user (JSON body)
-        \\  DELETE /api/users/:id   - Delete user
-    );
+/// GET / — Serve the static index.html dashboard page
+fn handleIndex(_: *http.Request, response: *http.Response, io: std.Io) anyerror!void {
+    if (!response.sendStaticFile(.{ .root_dir = "public" }, "/index.html", io)) {
+        try response.sendText(.not_found, "index.html not found");
+    }
 }
 
 /// GET /health — Health check endpoint
