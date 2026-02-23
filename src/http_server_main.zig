@@ -21,6 +21,7 @@ const router = http.Router.init(.{
     .{ .POST, "/api/echo-json", handleEchoJson },
     .{ .GET, "/dashboard/:id", handleDashboard },
     .{ .GET, "/metrics", handleMetrics },
+    .{ .GET, "/search", handleSearch },
     // ---- REST API: Users (Step 13) ----
     .{ .GET, "/api/users", handleListUsers },
     .{ .GET, "/api/users/:id", handleGetUser },
@@ -167,10 +168,31 @@ fn handleHello(request: *http.Request, response: *http.Response, _: std.Io) anye
 fn handleEcho(request: *http.Request, response: *http.Response, _: std.Io) anyerror!void {
     const body = try std.fmt.allocPrint(
         request.arena,
-        "Method: {s}\nPath: {s}\n",
-        .{ @tagName(request.method), request.path },
+        "Method: {s}\nPath: {s}\nQuery: {s}\n",
+        .{ @tagName(request.method), request.path, request.raw_query orelse "(none)" },
     );
     try response.sendText(.ok, body);
+}
+
+/// GET /search?q=hello+world&page=1&limit=10 — Query parameter demo.
+///
+/// Demonstrates the query parameter API:
+///   - `queryParam("key")` for single-value lookup (lazy-parsed, cached)
+///   - Values are automatically percent-decoded (`%20` → space, `+` → space)
+///   - Returns null for missing parameters (use `orelse` for defaults)
+///   - All allocations use the per-request arena (freed in bulk)
+fn handleSearch(request: *http.Request, response: *http.Response, _: std.Io) anyerror!void {
+    const query = request.queryParam("q") orelse "";
+    const page = request.queryParam("page") orelse "1";
+    const limit = request.queryParam("limit") orelse "20";
+
+    const body = try std.fmt.allocPrint(
+        request.arena,
+        \\{{"query":"{s}","page":{s},"limit":{s},"path":"{s}"}}
+    ,
+        .{ query, page, limit, request.path },
+    );
+    try response.sendJson(.ok, body);
 }
 
 /// POST /api/echo-json — Parse JSON body and echo it back as typed JSON.

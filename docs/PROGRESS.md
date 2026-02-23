@@ -2,9 +2,9 @@
 
 ## Project Progress Tracker
 
-> **Last Updated:** 2026-02-22  
+> **Last Updated:** 2026-02-23  
 > **Zig Version:** 0.16.0-dev.2535+b5bd49460  
-> **Status:** STEP 15 COMPLETE — Static file serving + Memory safety audit
+> **Status:** STEP 16 IN PROGRESS — Query parameter parsing
 
 ---
 
@@ -57,6 +57,14 @@
 | | 15-6: Wire into `http_server_main.zig` | ✅ COMPLETE |
 | | 15-7: Integration tests + documentation | ✅ COMPLETE |
 | | 15-8: Memory safety audit — fix leaks, add leak tests (90/90) | ✅ COMPLETE |
+| 16 | Query parameter parsing | ⏳ IN PROGRESS |
+| | 16-1: Split path/query in `fromHttpHead()` + `raw_query` field | 🔲 |
+| | 16-2: `percentDecode()` utility function | 🔲 |
+| | 16-3: `parseQueryParams()` — lazy parser with caching | 🔲 |
+| | 16-4: `queryParam(name)` — single value lookup | 🔲 |
+| | 16-5: `queryParamAll(name)` — multi-value lookup | 🔲 |
+| | 16-6: Unit tests for all query param features | 🔲 |
+| | 16-7: Demo handler + update docs (API.md, PROGRESS.md) | 🔲 |
 
 ---
 
@@ -1598,3 +1606,100 @@ AFTER (arena — automatic free, leak-impossible):
 
 All tests use `std.testing.allocator` (which detects leaks) inside `ArenaAllocator`
 to verify the exact allocation pattern used in production.
+
+---
+
+## Step 16: Query Parameter Parsing (IN PROGRESS)
+
+> **Goal:** Parse URL query strings (`?key=value&key2=value2`) and expose them
+> to handlers via a zero-copy, lazy-parsed API on `Request`.
+
+### Problem
+
+1. **`request.path` includes the raw query string** — `head.target` from `std.http.Server`
+   contains the full request target (e.g., `"/api/users?page=1&limit=10"`).
+2. **Router matching breaks with query strings** — The router splits `path` on `/`,
+   so the last segment becomes `"users?page=1"` which does **not** match `"users"`.
+3. **No handler API for query parameters** — Handlers have no way to read `?page=1`.
+
+### Design Decisions
+
+| Decision | Choice | Rationale |
+|----------|--------|-----------|
+| Path/query split point | `Request.fromHttpHead()` | Strip query string before it reaches router or handlers — fixes routing bug |
+| Storage | `raw_query: ?[]const u8` field on `Request` | Zero-copy slice into the read buffer (same as `path`) |
+| Parsing strategy | **Lazy** — parse on first call to `queryParam()` | Many requests have no query params; avoid wasted work |
+| Allocation | Per-request arena | Parsed params cached in arena; freed in bulk O(1) |
+| URL decoding | `percentDecode()` utility in `request.zig` | Decodes `%XX` hex pairs and `+` → space (form encoding) |
+| Zero-copy optimized | Return raw slice when no decoding needed | Avoid allocation for clean keys/values |
+| Multi-value support | `queryParamAll()` returns all values for a key | Supports `?tag=a&tag=b` patterns |
+| Max params | 32 (stack buffer, then arena-copy) | Bounded stack usage, same pattern as router's `max_params` |
+
+### Sub-Steps
+
+| Sub-Step | Description | Status |
+|----------|-------------|--------|
+| 16-1 | Split path/query in `fromHttpHead()` + `raw_query` field | 🔲 |
+| 16-2 | `percentDecode()` utility function | 🔲 |
+| 16-3 | `parseQueryParams()` — lazy parser with caching | 🔲 |
+| 16-4 | `queryParam(name)` — single value lookup | 🔲 |
+| 16-5 | `queryParamAll(name)` — multi-value lookup | 🔲 |
+| 16-6 | Unit tests for all query param features | 🔲 |
+| 16-7 | Demo handler + update docs (API.md, PROGRESS.md) | 🔲 |
+
+### API Design
+
+```zig
+// New fields on Request:
+raw_query: ?[]const u8 = null,       // "page=1&limit=10" (zero-copy into buffer)
+query_params: ?[]const QueryParam = null, // Cached parsed params (lazy)
+
+// New types:
+pub const QueryParam = struct {
+    key: []const u8,    // Decoded key
+    value: []const u8,  // Decoded value
+};
+
+// New methods:
+/// Get a single query parameter by name (first match). Lazy-parses on first call.
+pub fn queryParam(self: *Request, name: []const u8) ?[]const u8;
+
+/// Get all values for a query parameter name. Returns empty slice if none.
+pub fn queryParamAll(self: *Request, name: []const u8) []const []const u8;
+
+/// URL percent-decode a string. Returns original slice if no decoding needed (zero-copy).
+pub fn percentDecode(allocator: std.mem.Allocator, input: []const u8) ![]const u8;
+```
+
+### Example Handler Usage
+
+```zig
+/// GET /api/users?page=1&limit=10&sort=name
+fn handleListUsers(request: *http.Request, response: *http.Response, _: std.Io) anyerror!void {
+    const page = request.queryParam("page") orelse "1";
+    const limit = request.queryParam("limit") orelse "20";
+    const sort = request.queryParam("sort") orelse "id";
+    // ...
+}
+```
+
+### Files Modified
+
+| File | Change |
+|------|--------|
+| `src/http/request.zig` | Add `raw_query`, `QueryParam`, `queryParam()`, `queryParamAll()`, `percentDecode()`, tests |
+| `src/http/connection.zig` | No change needed — `fromHttpHead()` handles the split |
+| `src/http_server_main.zig` | Add demo handler using query params |
+| `docs/API.md` | Document new `Request` fields and methods |
+| `docs/PROGRESS.md` | This section |
+
+### Performance Considerations
+
+| Aspect | Strategy |
+|--------|----------|
+| No-query fast path | `raw_query == null` → `queryParam()` returns null immediately (zero work) |
+| Lazy parsing | Query string only parsed when first accessed by a handler |
+| Zero-copy keys/values | If no `%`-encoding or `+` in a value, return slice into original buffer |
+| Bounded stack buffer | Parse into `[32]QueryParam` on stack, copy to arena only if needed |
+| Arena allocation | All decoded strings freed in bulk O(1) with request |
+| Router fix | Path stripped at parse time — router never sees query string |

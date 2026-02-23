@@ -182,7 +182,8 @@ and zero-copy access to parsed data.
 | Field | Type | Description |
 |-------|------|-------------|
 | `method` | `std.http.Method` | HTTP method (GET, POST, etc.) |
-| `path` | `[]const u8` | Request path (zero-copy slice into read buffer) |
+| `path` | `[]const u8` | Request path with query string stripped (zero-copy) |
+| `raw_query` | `?[]const u8` | Raw query string without `?` (zero-copy, null if none) |
 | `version` | `std.http.Version` | HTTP version (1.0 or 1.1) |
 | `keep_alive` | `bool` | Whether client wants keep-alive |
 | `content_type` | `?[]const u8` | Content-Type header value (zero-copy) |
@@ -196,6 +197,18 @@ and zero-copy access to parsed data.
 ```zig
 /// Get a path parameter by name. Returns null if not found.
 pub fn pathParam(self: *const Request, name: []const u8) ?[]const u8;
+
+/// Get a single query parameter by name (first match). Lazy-parsed on first call.
+/// Values are percent-decoded. Zero-copy when no decoding is needed.
+pub fn queryParam(self: *Request, name: []const u8) ?[]const u8;
+
+/// Get all values for a query parameter name (e.g., ?tag=a&tag=b).
+/// Returns an arena-allocated slice. Empty slice if no matches.
+pub fn queryParamAll(self: *Request, name: []const u8) []const []const u8;
+
+/// URL percent-decode a string (%XX → byte, + → space).
+/// Returns original slice if no decoding needed (zero-copy).
+pub fn percentDecode(allocator: std.mem.Allocator, input: []const u8) ![]const u8;
 
 /// Read the request body from the stream. Caches the result.
 /// Returns error.NoBody for GET/HEAD or if Content-Length is 0.
@@ -211,6 +224,20 @@ pub fn headerIterator(self: *const Request) std.http.HeaderIterator;
 
 /// Get a specific header value by name (case-insensitive).
 pub fn getHeader(self: *const Request, name: []const u8) ?[]const u8;
+```
+
+**Query parameter example:**
+```zig
+/// GET /api/users?page=2&limit=10&sort=name
+fn handleListUsers(request: *http.Request, response: *http.Response, _: std.Io) anyerror!void {
+    const page = request.queryParam("page") orelse "1";
+    const limit = request.queryParam("limit") orelse "20";
+    const sort = request.queryParam("sort") orelse "id";
+    // page="2", limit="10", sort="name"
+}
+
+/// GET /search?q=hello+world  →  request.queryParam("q") = "hello world"
+/// GET /filter?tag=a&tag=b    →  request.queryParamAll("tag") = {"a", "b"}
 ```
 
 **JSON parsing example:**
@@ -403,8 +430,9 @@ pub const CreateUserInput = struct { name: []const u8, email: []const u8, age: ?
 | GET | `/` | `handleIndex` | Serves `public/index.html` (static file) |
 | GET | `/health` | `handleHealth` | Health check → `{"status":"ok"}` |
 | GET | `/hello/:name` | `handleHello` | Greeting with path parameter |
-| POST | `/echo` | `handleEcho` | Echoes method and path |
+| POST | `/echo` | `handleEcho` | Echoes method, path, and query string |
 | POST | `/api/echo-json` | `handleEchoJson` | JSON round-trip demo |
+| GET | `/search` | `handleSearch` | Query parameter demo (`?q=...&page=1&limit=10`) |
 | GET | `/dashboard/:id` | `handleDashboard` | Fan-out concurrency demo |
 | GET | `/metrics` | `handleMetrics` | Server stats (atomic counters) |
 
