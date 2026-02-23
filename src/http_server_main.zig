@@ -10,6 +10,7 @@
 const std = @import("std");
 const http = @import("zzigtop").http;
 const db = @import("zzigtop").db;
+const html = @import("zzigtop").html;
 const pg = @import("pg");
 
 /// Comptime-defined routes — compiled into an optimized match table.
@@ -28,6 +29,12 @@ const router = http.Router.init(.{
     .{ .POST, "/api/users", handleCreateUser },
     .{ .PUT, "/api/users/:id", handleUpdateUser },
     .{ .DELETE, "/api/users/:id", handleDeleteUser },
+    // ---- htmx + Template Demo (Step 17) ----
+    .{ .GET, "/htmx", handleHtmxDemo },
+    .{ .GET, "/htmx/time", handleHtmxTime },
+    .{ .POST, "/htmx/counter", handleHtmxCounter },
+    .{ .GET, "/htmx/users", handleHtmxUsers },
+    .{ .GET, "/htmx/search", handleHtmxSearch },
 });
 
 /// Module-level pointer to server stats (set once during startup).
@@ -428,4 +435,147 @@ fn handleDeleteUser(request: *http.Request, response: *http.Response, _: std.Io)
     } else {
         try response.sendJsonValue(.not_found, .{ .@"error" = "User not found" });
     }
+}
+
+// ============================================================================
+// htmx + Comptime Template Demo (Step 17)
+// ============================================================================
+
+/// Atomic click counter for the htmx demo.
+var htmx_counter = std.atomic.Value(u32).init(0);
+
+// ---- Comptime Templates (parsed at compile time, zero runtime overhead) ----
+
+/// Template: server time fragment (polled every 2s by htmx).
+const time_template = html.Template.compile(
+    \\<span>{{time}}</span>
+);
+
+/// Template: click counter value fragment.
+const counter_template = html.Template.compile(
+    \\{{count}}
+);
+
+/// Template: user table rows rendered via {{#each}}.
+const user_rows_template = html.Template.compile(
+    \\{{#each users}}<tr class="fade-in">
+    \\  <td>{{name}}</td>
+    \\  <td>{{email}}</td>
+    \\  <td>{{#if active}}<span class="badge">Active</span>{{else}}<span class="badge badge-inactive">Inactive</span>{{/if}}</td>
+    \\</tr>
+    \\{{/each}}
+);
+
+/// Template: search result rows.
+const search_results_template = html.Template.compile(
+    \\{{#if has_query}}{{#if has_results}}<table style="width:100%">
+    \\  {{#each results}}<tr class="fade-in"><td>{{name}}</td><td>{{email}}</td></tr>
+    \\  {{/each}}</table>{{else}}<p style="color:#666;">No results for "{{query}}"</p>{{/if}}{{/if}}
+);
+
+/// Demo user data for the htmx templates.
+const DemoUser = struct {
+    name: []const u8,
+    email: []const u8,
+    active: bool,
+};
+
+const demo_users = [_]DemoUser{
+    .{ .name = "Alice Chen", .email = "alice@example.com", .active = true },
+    .{ .name = "Bob Smith", .email = "bob@example.com", .active = true },
+    .{ .name = "Carol Wu", .email = "carol@example.com", .active = false },
+    .{ .name = "Dave Jones", .email = "dave@example.com", .active = true },
+    .{ .name = "Eve Brown", .email = "eve@example.com", .active = false },
+};
+
+/// GET /htmx — Serve the htmx demo page.
+fn handleHtmxDemo(_: *http.Request, response: *http.Response, io: std.Io) anyerror!void {
+    if (global_static_config) |sc| {
+        if (response.sendStaticFile(sc, "/htmx-demo.html", io)) return;
+    }
+    try response.sendText(.not_found, "htmx-demo.html not found. Ensure --static-dir points to public/");
+}
+
+/// GET /htmx/time — Returns the current server time as an HTML fragment.
+/// Polled by htmx every 2 seconds.
+fn handleHtmxTime(request: *http.Request, response: *http.Response, io: std.Io) anyerror!void {
+    const now = std.Io.Clock.now(.real, io);
+    const epoch_secs: i64 = @intCast(@divTrunc(now.nanoseconds, std.time.ns_per_s));
+    const secs: i64 = @mod(epoch_secs, 86400);
+    const hours: i64 = @divTrunc(secs, 3600);
+    const mins: i64 = @divTrunc(@mod(secs, 3600), 60);
+    const s: i64 = @mod(secs, 60);
+
+    const time_str = try std.fmt.allocPrint(
+        request.arena,
+        "{d:0>2}:{d:0>2}:{d:0>2} UTC",
+        .{ hours, mins, s },
+    );
+
+    const body = try time_template.render(request.arena, .{ .time = time_str });
+    try response.sendHtml(.ok, body);
+}
+
+/// POST /htmx/counter — Increment the counter and return the new value.
+fn handleHtmxCounter(request: *http.Request, response: *http.Response, _: std.Io) anyerror!void {
+    const count = htmx_counter.fetchAdd(1, .monotonic) + 1;
+
+    var buf: [12]u8 = undefined;
+    const count_str = try std.fmt.bufPrint(&buf, "{d}", .{count});
+
+    const body = try counter_template.render(request.arena, .{ .count = count_str });
+    try response.sendHtml(.ok, body);
+}
+
+/// GET /htmx/users — Return user table rows as an HTML fragment.
+/// Rendered using a comptime template with {{#each}}.
+fn handleHtmxUsers(request: *http.Request, response: *http.Response, _: std.Io) anyerror!void {
+    const body = try user_rows_template.render(request.arena, .{ .users = &demo_users });
+    try response.sendHtml(.ok, body);
+}
+
+/// GET /htmx/search?q=... — Search users and return results as HTML fragment.
+/// Demonstrates comptime templates with htmx live search.
+fn handleHtmxSearch(request: *http.Request, response: *http.Response, _: std.Io) anyerror!void {
+    const query = request.queryParam("q") orelse "";
+
+    if (query.len == 0) {
+        try response.sendHtml(.ok, "");
+        return;
+    }
+
+    // Filter demo users by name (case-insensitive substring match).
+    var matches: [demo_users.len]DemoUser = undefined;
+    var match_count: usize = 0;
+    for (&demo_users) |user| {
+        if (containsIgnoreCase(user.name, query) or containsIgnoreCase(user.email, query)) {
+            matches[match_count] = user;
+            match_count += 1;
+        }
+    }
+
+    const body = try search_results_template.render(request.arena, .{
+        .has_query = query.len > 0,
+        .has_results = match_count > 0,
+        .query = query,
+        .results = matches[0..match_count],
+    });
+    try response.sendHtml(.ok, body);
+}
+
+/// Case-insensitive substring search.
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len > haystack.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        var matched = true;
+        for (0..needle.len) |j| {
+            if (std.ascii.toLower(haystack[i + j]) != std.ascii.toLower(needle[j])) {
+                matched = false;
+                break;
+            }
+        }
+        if (matched) return true;
+    }
+    return false;
 }

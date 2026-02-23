@@ -8,6 +8,9 @@ pub const http = @import("http/http.zig");
 /// Database connection pool and repository types.
 pub const db = @import("db/db.zig");
 
+/// Comptime HTML template engine and htmx integration.
+pub const html = @import("html/html.zig");
+
 /// This is a documentation comment to explain the `printAnotherMessage` function below.
 ///
 /// Accepting an `Io.Writer` instance is a handy way to write reusable code.
@@ -27,4 +30,5 @@ test "basic add functionality" {
 test {
     // Pull in tests from all submodules
     _ = http;
+    _ = html;
 }

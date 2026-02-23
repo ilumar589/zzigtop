@@ -4,7 +4,7 @@
 
 > **Last Updated:** 2026-02-23  
 > **Zig Version:** 0.16.0-dev.2535+b5bd49460  
-> **Status:** STEP 16 IN PROGRESS — Query parameter parsing
+> **Status:** STEP 17 COMPLETE — Comptime HTML templates + htmx integration
 
 ---
 
@@ -65,6 +65,16 @@
 | | 16-5: `queryParamAll(name)` — multi-value lookup | 🔲 |
 | | 16-6: Unit tests for all query param features | 🔲 |
 | | 16-7: Demo handler + update docs (API.md, PROGRESS.md) | 🔲 |
+| 17 | Comptime HTML templates + htmx integration | ✅ COMPLETE |
+| | 17-1: `src/html/template.zig` — comptime template parser + renderer | ✅ COMPLETE |
+| | 17-2: `src/html/htmx.zig` — htmx request detection + response headers | ✅ COMPLETE |
+| | 17-3: `src/html/html.zig` — module root + re-exports | ✅ COMPLETE |
+| | 17-4: Wire into `root.zig` (export `html` module) | ✅ COMPLETE |
+| | 17-5: `sendTemplate()` on Response — render + send convenience | ✅ COMPLETE |
+| | 17-6: htmx demo page (`public/htmx-demo.html`) | ✅ COMPLETE |
+| | 17-7: Demo handlers in `http_server_main.zig` (time, counter, users, search) | ✅ COMPLETE |
+| | 17-8: Unit tests (25+ template tests, htmx detection tests) | ✅ COMPLETE |
+| | 17-9: Documentation (PROGRESS.md) | ✅ COMPLETE |
 
 ---
 
@@ -1703,3 +1713,168 @@ fn handleListUsers(request: *http.Request, response: *http.Response, _: std.Io) 
 | Bounded stack buffer | Parse into `[32]QueryParam` on stack, copy to arena only if needed |
 | Arena allocation | All decoded strings freed in bulk O(1) with request |
 | Router fix | Path stripped at parse time — router never sees query string |
+
+---
+
+## Step 17: Comptime HTML Templates + htmx Integration (COMPLETE)
+
+> **Goal:** Build a comptime template engine in `src/html/` that parses
+> Mustache-style templates at compile time, producing zero-overhead render
+> functions. Integrate with htmx for server-driven partial HTML updates.
+
+### Problem
+
+1. **No server-side templating** — handlers must manually build HTML strings
+   with `std.fmt.allocPrint`, which is error-prone and unreadable.
+2. **No htmx support** — no way to detect htmx AJAX requests or set htmx
+   response headers (HX-Trigger, HX-Redirect, etc.).
+3. **XSS risk** — manual HTML construction easily leads to unescaped user input.
+
+### Design Decisions
+
+| Decision | Choice | Rationale |
+|----------|--------|-----------|
+| Template parsing | **Comptime** | Zero runtime parsing overhead; template errors caught at compile time |
+| Template syntax | Mustache-like (`{{var}}`, `{{#each}}`, `{{#if}}`) | Widely known, minimal, adequate for server fragments |
+| HTML escaping | **Default on** (`{{var}}`), opt-out via `{{&var}}` | Secure by default — prevents XSS |
+| Node representation | Comptime tree of `Node` structs | Natural recursive structure for nested blocks |
+| Rendering | `inline for` over comptime nodes | Compiler unrolls all node dispatch; runtime is straight-line writes |
+| Field access | `@field(data, name)` at comptime | Type-safe — missing fields are compile errors |
+| Output buffer | `ArrayListUnmanaged(u8)` + allocator | Arena-friendly; single contiguous output |
+| Writer support | `renderWriter()` alternative | Streaming output without buffering (for large pages) |
+| htmx detection | Read `HX-Request` header via `Request.getHeader()` | Standard htmx protocol; case-insensitive header match |
+| htmx responses | Helper functions setting `HX-*` headers | Clean API; all htmx headers documented |
+| Module location | `src/html/` (separate from `src/http/`) | Templates are reusable beyond HTTP (emails, CLI, etc.) |
+
+### Template Syntax
+
+```
+{{name}}                       Variable — HTML-escaped (XSS-safe)
+{{&name}}                      Variable — raw/unescaped (trusted HTML)
+{{.}}                          Current context value (in #each loops)
+{{#each items}}...{{/each}}    Iterate over a slice field
+{{#if flag}}...{{/if}}         Conditional (truthy check)
+{{#if flag}}...{{else}}...{{/if}}  Conditional with else branch
+```
+
+### Truthy Rules (for `{{#if}}`)
+
+| Type | Truthy when |
+|------|------------|
+| `bool` | `true` |
+| `?T` (optional) | `!= null` |
+| `[]T` (slice) | `.len > 0` |
+| `[]const u8` | `.len > 0` |
+| integers | `!= 0` |
+| structs, enums | always truthy |
+
+### Sub-Steps
+
+| Sub-Step | Description | Status |
+|----------|-------------|--------|
+| 17-1 | `src/html/template.zig` — comptime parser + render engine | ✅ COMPLETE |
+| 17-2 | `src/html/htmx.zig` — request detection + response header helpers | ✅ COMPLETE |
+| 17-3 | `src/html/html.zig` — module root with re-exports | ✅ COMPLETE |
+| 17-4 | Wire into `root.zig` (export `html` module) | ✅ COMPLETE |
+| 17-5 | `sendTemplate()` on Response — render + send convenience method | ✅ COMPLETE |
+| 17-6 | htmx demo page (`public/htmx-demo.html`) with htmx 2.0 | ✅ COMPLETE |
+| 17-7 | Demo handlers: time polling, counter, user list, live search | ✅ COMPLETE |
+| 17-8 | Unit tests (25+ template tests, 7 htmx detection tests) | ✅ COMPLETE |
+| 17-9 | Documentation (this section in PROGRESS.md) | ✅ COMPLETE |
+
+### API — Template Engine
+
+```zig
+const html = @import("zzigtop").html;
+
+// Compile template at comptime (zero runtime cost)
+const UserCard = html.Template.compile(
+    \\<div class="card">
+    \\  <h2>{{name}}</h2>
+    \\  {{#if active}}<span class="badge">Active</span>{{/if}}
+    \\  <ul>
+    \\    {{#each roles}}<li>{{.}}</li>{{/each}}
+    \\  </ul>
+    \\</div>
+);
+
+// Render at runtime with typed data
+const output = try UserCard.render(allocator, .{
+    .name = "Alice",
+    .active = true,
+    .roles = &[_][]const u8{ "admin", "editor" },
+});
+
+// Or use the Response convenience method
+try response.sendTemplate(.ok, UserCard, .{ .name = "Alice", ... });
+```
+
+### API — htmx Helpers
+
+```zig
+const Htmx = @import("zzigtop").html.Htmx;
+
+// Request detection
+if (Htmx.isHtmxRequest(request)) { ... }  // HX-Request: true
+if (Htmx.isBoosted(request)) { ... }      // HX-Boosted: true
+const target = Htmx.target(request);       // HX-Target header
+
+// Response headers
+try Htmx.trigger(response, "userCreated");     // HX-Trigger
+try Htmx.redirect(response, "/login");          // HX-Redirect
+try Htmx.pushUrl(response, "/users/42");         // HX-Push-Url
+try Htmx.reswap(response, .outerHTML);           // HX-Reswap
+try Htmx.retarget(response, "#main");            // HX-Retarget
+try Htmx.refresh(response);                      // HX-Refresh
+Htmx.stopPolling(response);                      // HTTP 286
+```
+
+### htmx Handler Pattern
+
+```zig
+fn handleUsers(req: *Request, res: *Response, _: Io) !void {
+    const users = try getUsers();
+    if (html.Htmx.isHtmxRequest(req)) {
+        // htmx AJAX request → return HTML fragment only
+        try res.sendTemplate(.ok, UserRowsPartial, .{ .users = users });
+    } else {
+        // Normal browser request → return full page
+        try res.sendTemplate(.ok, UsersFullPage, .{ .users = users });
+    }
+}
+```
+
+### Files Created / Modified
+
+| File | Change |
+|------|--------|
+| `src/html/template.zig` | **NEW** — Comptime template parser, renderer, HTML escaping, 25+ tests |
+| `src/html/htmx.zig` | **NEW** — htmx request/response helpers, 7 tests |
+| `src/html/html.zig` | **NEW** — Module root, re-exports Template + Htmx |
+| `src/root.zig` | Added `pub const html = @import("html/html.zig")` + test import |
+| `src/http/response.zig` | Added `sendTemplate()` convenience method |
+| `src/http_server_main.zig` | Added 5 htmx demo routes + handlers + comptime templates |
+| `public/htmx-demo.html` | **NEW** — htmx demo page (polling, counter, user list, search) |
+| `docs/PROGRESS.md` | This section |
+
+### Performance Considerations
+
+| Aspect | Strategy |
+|--------|----------|
+| Zero parsing at runtime | Templates fully parsed at comptime; render is buffer writes only |
+| Type safety | `@field(data, name)` verified at comptime — missing field = compile error |
+| Inline dispatch | `inline for` unrolls node traversal — no runtime tag dispatch |
+| HTML escaping | Per-byte switch — fast for typical short strings |
+| Arena-friendly | Single `ArrayListUnmanaged` output buffer; freed in bulk O(1) |
+| Writer path | `renderWriter()` streams directly to socket (no intermediate buffer) |
+| XSS prevention | All variables HTML-escaped by default; `{{&raw}}` for trusted content |
+
+### Demo Routes
+
+| Route | Method | Description |
+|-------|--------|-------------|
+| `/htmx` | GET | Serves the htmx demo page |
+| `/htmx/time` | GET | Server time fragment (polled every 2s) |
+| `/htmx/counter` | POST | Increment counter, return updated HTML |
+| `/htmx/users` | GET | User table rows via `{{#each}}` template |
+| `/htmx/search?q=...` | GET | Live search with debounced input |

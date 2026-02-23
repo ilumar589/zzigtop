@@ -164,6 +164,23 @@ pub fn sendHtml(self: *Response, status: http.Status, body: []const u8) !void {
     try self.flush();
 }
 
+/// Render a comptime template and send the result as an HTML response.
+///
+/// Combines template rendering and HTML response in one call.
+/// The rendered output is allocated in the response arena and freed
+/// automatically when the request completes.
+///
+/// Usage:
+///   const Tmpl = html.Template.compile("<h1>{{title}}</h1>");
+///   try response.sendTemplate(.ok, Tmpl, .{ .title = "Hello" });
+pub fn sendTemplate(self: *Response, status: http.Status, comptime Tmpl: type, data: anytype) !void {
+    const body = try Tmpl.render(self.arena, data);
+    self.status = status;
+    self.body = body;
+    try self.addHeader("content-type", "text/html; charset=utf-8");
+    try self.flush();
+}
+
 /// Try to serve a static file for the given request path.
 ///
 /// Returns true if the file was found and served, false otherwise.
