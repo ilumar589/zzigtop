@@ -79,7 +79,24 @@ Connections are dispatched as async tasks via `Io.Group.async()`. The Zig `std.I
 
 - **Threaded backend** (Windows / fallback): Tasks run on a dynamic thread pool. Threads are spawned lazily (not pre-allocated), up to CPU_COUNT-1. When all threads are busy, new tasks run inline on the accept thread (natural backpressure). No manual thread count configuration needed.
 
-This replaces the earlier fixed-size thread pool (`thread_pool.zig`) with the runtime's built-in scheduler, which is more efficient and requires zero configuration.
+This replaced the earlier connection-dispatch thread pool with the runtime's built-in scheduler, which is more efficient and requires zero configuration for I/O work.
+
+### 2a. CPU Work Pool (Separate from I/O)
+`thread_pool.zig` provides a dedicated OS thread pool for **CPU-bound** tasks (hashing, compression, image processing, encryption, etc.).
+
+The I/O runtime is optimized for tasks that yield on I/O. CPU-bound work blocks the fiber/thread, preventing it from handling other connections. The CPU pool keeps these workloads separate:
+
+- **I/O pool** (`Io.Group`): Handles connection accept, read/write, sleep — tasks that yield frequently.
+- **CPU pool** (`CpuPool`): Handles computation — tasks that run to completion without yielding.
+- **Thread budget**: CPU pool defaults to `CPU_COUNT / 2` threads, leaving the rest for I/O.
+
+Each CPU worker gets a `FixedBufferAllocator` for bounded scratch space (reset per task, zero heap interaction). Tasks are submitted via a bounded `Io.Queue` with backpressure — when all workers are busy and the queue is full, submission blocks the caller.
+
+```
+Handler (I/O fiber) ──submit──► Io.Queue ──► CPU Worker Thread
+                                              │ FBA scratch
+                     ◄──completion flag────────┘
+```
 
 ### 3. Arena-per-Request
 Each HTTP request gets a dedicated arena allocator. All allocations during request processing (route params, parsed data, response building) use this arena. When the request completes, the entire arena is freed in a single O(1) operation.
@@ -130,7 +147,7 @@ src/
 │   ├── request.zig       — HTTP request wrapper with arena
 │   ├── response.zig      — HTTP response builder with vectored writes
 │   ├── parser.zig        — SIMD-accelerated HTTP parsing utilities
-│   └── thread_pool.zig   — Legacy fixed-size thread pool (superseded)
+│   ├── thread_pool.zig   — CPU-bound task pool (FixedBufferAllocator workers)
 ├── http_server_main.zig  — Executable entry point (HTTP server + REST API)
 ├── db_integration_test.zig — Database integration tests (requires PostgreSQL)
 ├── integration_test.zig  — HTTP integration tests
@@ -157,12 +174,15 @@ Main Thread (owns allocator + Io from std.process.Init)
 ├─ Server.start(allocator, io, config)
 │   └─ Binds TCP listener (no threads spawned here)
 │
+├─ CpuPool.init(allocator, io, config)  [optional, for CPU-bound work]
+│   └─ Spawns N dedicated OS threads (default: CPU_COUNT / 2)
+│
 ├─ Accept Loop (server.run)
 │   ├─ accept() → group.async(Connection.handleAsync, {stream, io, router, alloc})
 │   ├─ accept() → group.async(...)   ← Io runtime spawns fibers/threads on demand
 │   └─ accept() → group.async(...)   ← runs inline if all workers busy (backpressure)
 │
-│   Io Runtime (automatic)
+│   Io Runtime (automatic) — for I/O-bound work
 │   ├─ Evented: stackful fibers, work-stealing across OS threads
 │   └─ Threaded: dynamic thread pool, lazy spawn up to CPU_COUNT-1
 │
@@ -173,11 +193,18 @@ Task 1 (fiber/thread)    Task 2                Task 3
 ├─ Parse headers          ├─ Parse headers      ├─ Parse headers
 ├─ Route match            ├─ Route match        ├─ Route match
 ├─ Call handler           ├─ Call handler        ├─ Call handler
+│   └─ cpu_pool.submit()  │                     │  ← optional CPU offload
+│   └─ spin-wait result   │                     │
 ├─ Write response         ├─ Write response     ├─ Write response
 ├─ arena.reset()          ├─ arena.reset()      ├─ arena.reset()
 ├─ (keep-alive loop)      ├─ (keep-alive loop)  ├─ Close
 ├─ Close                  └─ Close              └─ arena.deinit()
 └─ arena.deinit()         ← task completes, Io runtime reclaims resources
+
+                          CPU Pool (dedicated OS threads)
+                          ├─ Worker 1: queue.get() → task.run_fn() → signal done
+                          ├─ Worker 2: queue.get() → task.run_fn() → signal done
+                          └─ Worker N: ...  (each has FixedBufferAllocator scratch)
 ```
 
 ## Memory Model
@@ -192,6 +219,10 @@ Per-Request (arena-allocated, backed by explicit allocator):
 ├── Route params:  []Param  — Extracted path parameters
 ├── Handler data:  varies   — Whatever the handler allocates
 └── Freed in bulk when request completes
+
+Per-CPU-Worker (pre-allocated, reused forever):
+├── Scratch buffer: [64KB]u8  — FixedBufferAllocator per task
+└── Reset per task (O(1) bump pointer reset, zero syscalls)
 ```
 
 ## Data Flow for a Single Request

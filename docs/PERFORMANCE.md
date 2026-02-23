@@ -458,6 +458,130 @@ query re-parsing overhead on the PostgreSQL side.
 
 ---
 
+## 16. FixedBufferAllocator for Bounded Scratch Space
+
+**File:** `thread_pool.zig` (CPU worker scratch), applicable anywhere
+
+**What:** Use `std.heap.FixedBufferAllocator` when you need an `Allocator`
+interface but know the maximum allocation size at design time. The FBA
+wraps a fixed buffer (stack-allocated or pre-allocated on the heap) and
+provides zero-overhead bump allocation with no heap interaction.
+
+**Why:** Arena allocators are excellent for request lifetimes, but they
+still interact with the backing heap allocator when they need new pages.
+FixedBufferAllocator avoids this entirely — all memory comes from a
+pre-existing buffer. This is ideal for:
+- CPU task scratch space (worker threads with known bounded size)
+- Formatting into a bounded buffer via the Allocator interface
+- Library functions that require an `Allocator` but produce bounded output
+- Hot paths where even arena page-allocation overhead matters
+
+**Zig implementation:**
+```zig
+// Stack-backed: zero heap interaction
+var buf: [4096]u8 = undefined;
+var fba = std.heap.FixedBufferAllocator.init(&buf);
+const allocator = fba.allocator();
+
+// Use allocator normally — bumps a pointer, no syscalls
+const data = try allocator.alloc(u8, 256);
+// ... use data ...
+
+// No free needed — buffer is on the stack (or reset FBA to reuse)
+fba.reset(); // O(1): just resets the bump pointer to 0
+```
+
+**In the CPU pool:**
+```zig
+// Each worker thread gets a pre-allocated scratch buffer.
+// FixedBufferAllocator is re-created per task (automatic reset).
+fn workerFn(inner: *Inner, scratch_buf: []u8) void {
+    while (true) {
+        const task = inner.queue.getOneUncancelable(inner.io) catch break;
+        var fba = std.heap.FixedBufferAllocator.init(scratch_buf);
+        task.run_fn(task.context, fba.allocator());
+    }
+}
+```
+
+**When to use which allocator:**
+
+| Scenario | Allocator |
+|---|---|
+| Request lifetime, variable size | `ArenaAllocator` |
+| Known max size, library needs `Allocator` | `FixedBufferAllocator` |
+| CPU task temp buffers (pooled workers) | `FixedBufferAllocator` |
+| Stack buffer sufficient, no `Allocator` needed | Raw `[N]u8` array |
+| Long-lived objects across requests | General purpose (`init.gpa`) |
+
+**Impact:** Eliminates all allocator overhead. No heap metadata, no
+fragmentation, no lock contention. The bump pointer is a single
+`usize` increment — the fastest possible allocation strategy.
+
+---
+
+## 17. CPU Work Pool (Offloading CPU-Bound Tasks)
+
+**File:** `thread_pool.zig`
+
+**What:** A dedicated pool of OS threads for CPU-intensive work, separate
+from the I/O runtime's connection-handling threads/fibers. Handlers submit
+CPU tasks to this pool, keeping I/O fibers free to handle connections.
+
+**Why:** The I/O runtime (`Io.Group`) is optimized for tasks that mostly wait
+on I/O (network, disk). CPU-bound work blocks the fiber/thread, preventing
+it from handling other connections. On the Windows threaded backend, this is
+especially severe — each blocked thread is one fewer connection handler.
+A separate CPU pool ensures:
+- Connection handling stays responsive under CPU load
+- CPU threads can be sized independently of I/O capacity
+- Natural backpressure when CPU capacity is exhausted
+
+**Architecture:**
+```
+I/O Runtime (connections)          CPU Pool (computation)
+┌─────────────┐                    ┌──────────────────┐
+│ Fiber/Thread │──submit(task)────►│ Worker 1 (FBA)   │
+│ (handler)    │                   │                  │
+│              │◄──completion──────│                  │
+├─────────────┤                    ├──────────────────┤
+│ Fiber/Thread │──submit(task)────►│ Worker 2 (FBA)   │
+│ (handler)    │                   │                  │
+│              │◄──completion──────│                  │
+└─────────────┘                    └──────────────────┘
+   Io.Group                          std.Thread pool
+```
+
+**Usage pattern:**
+```zig
+const CpuPool = http.CpuPool;
+
+// Server startup:
+var cpu_pool = try CpuPool.init(allocator, io, .{
+    .num_threads = 4,          // Half of CPU cores
+    .scratch_size = 64 * 1024, // 64KB scratch per worker
+});
+defer cpu_pool.shutdown(io);
+
+// In a handler — submit + wait:
+fn handleHash(request: *Request, response: *Response, io: std.Io) !void {
+    var ctx = HashContext{ .data = request.body orelse "" };
+    cpu_pool.submitAndWait(&HashContext.compute, @ptrCast(&ctx));
+    try response.sendText(.ok, &ctx.result);
+}
+```
+
+**Thread count guideline:**
+- CPU pool: `CPU_COUNT / 2` threads (for compute)
+- I/O runtime: remaining cores (for connections)
+- Total active threads ≈ CPU_COUNT (avoids oversubscription)
+
+**Impact:** Prevents CPU-heavy handlers from starving connection handling.
+Under mixed workloads (I/O + CPU), overall throughput improves because
+I/O fibers remain available to accept and serve lightweight requests.
+
+---
+
 ## Techniques NOT Used (and Why)
 
 ### io_uring / IOCP

@@ -8,6 +8,7 @@ pub const Router = @import("router.zig");
 pub const Request = @import("request.zig");
 pub const Response = @import("response.zig");
 pub const parser = @import("parser.zig");
+pub const CpuPool = @import("thread_pool.zig");
 
 // Re-export common std.http types for convenience
 const std = @import("std");

@@ -4,7 +4,7 @@
 
 > **Last Updated:** 2026-02-22  
 > **Zig Version:** 0.16.0-dev.2535+b5bd49460  
-> **Status:** STEP 13 COMPLETE — PostgreSQL database integration
+> **Status:** STEP 14 COMPLETE — CPU work pool + FixedBufferAllocator
 
 ---
 
@@ -43,6 +43,11 @@
 | | 13-4: User repository (CRUD with parameterized queries) | ✅ COMPLETE |
 | | 13-5: REST API handlers (JSON + DB) | ✅ COMPLETE |
 | | 13-6: Integration tests & documentation | ✅ COMPLETE |
+| 14 | CPU work pool + FixedBufferAllocator | ✅ COMPLETE |
+| | 14-1: Refactor thread_pool.zig → CpuPool (generic CPU task pool) | ✅ COMPLETE |
+| | 14-2: FixedBufferAllocator per worker (bounded scratch space) | ✅ COMPLETE |
+| | 14-3: Export CpuPool from http module | ✅ COMPLETE |
+| | 14-4: Documentation (PERFORMANCE.md, ARCHITECTURE.md) | ✅ COMPLETE |
 
 ---
 

@@ -1,125 +1,183 @@
-//! *** SUPERSEDED — kept for reference ***
+//! CPU-bound task pool.
 //!
-//! This fixed-size thread pool has been replaced by Io.Group async dispatch
-//! in server.zig. The new approach uses Zig's built-in Io runtime:
-//!   - Evented backend: stackful fibers + work-stealing
-//!   - Threaded backend: dynamic thread pool (lazy spawn)
+//! Dedicated OS thread pool for offloading CPU-intensive work from
+//! the I/O runtime's fibers/threads. Keeps connection handling
+//! responsive while heavy computation runs on separate threads.
 //!
-//! The code below is preserved as a reference for manual thread pool
-//! implementation using Io.Queue(T) and std.Thread.
+//! Use cases:
+//!   - Password hashing (bcrypt, argon2)
+//!   - Data compression / decompression
+//!   - Image processing / resizing
+//!   - Template rendering
+//!   - Cryptographic operations
+//!   - Complex data transformations
 //!
-//! -----------------------------------------------------------------------
+//! Architecture:
 //!
-//! Fixed-size thread pool for connection handling.
+//!   ┌─────────────────┐         ┌──────────────────────┐
+//!   │  I/O fiber       │  submit │  CPU Worker Thread   │
+//!   │  (handler)       ├───────►│  FixedBufferAlloc    │
+//!   │                  │  Queue  │  scratch space       │
+//!   │  spin-wait  ◄────┼────────┤  signals completion  │
+//!   └─────────────────┘         └──────────────────────┘
 //!
-//! Instead of spawning a new OS thread per connection (which is expensive
-//! and limits scalability), this pool pre-spawns a configurable number of
-//! worker threads that pull connections from a bounded, thread-safe queue.
+//! Each worker gets a FixedBufferAllocator for bounded scratch space,
+//! avoiding heap allocation for temporary CPU work buffers. The scratch
+//! allocator is reset between tasks — memory doesn't persist across tasks.
 //!
-//! Features:
-//! - Configurable worker count (defaults to CPU count)
-//! - Bounded connection queue with backpressure (when full, accept blocks)
-//! - Graceful shutdown via queue close
-//! - Workers handle keep-alive internally (many requests per connection)
+//! The pool uses a bounded queue with backpressure. When all CPU workers
+//! are busy and the queue is full, submit() blocks the caller until a
+//! slot opens (natural backpressure prevents task overload).
 //!
-//! The inner state is heap-allocated so worker threads always hold a
-//! stable pointer, even when the outer handle is returned by value.
+//! Graceful shutdown: close the queue → workers finish current task →
+//! all threads join → resources freed.
 
 const std = @import("std");
 const Io = std.Io;
-const net = Io.net;
 
-const Connection = @import("connection.zig");
-const Router = @import("router.zig");
+const CpuPool = @This();
 
-const ThreadPool = @This();
+// ============================================================================
+// Public types
+// ============================================================================
 
-/// A pending connection job for a worker to handle.
-const Job = struct {
-    stream: net.Stream,
+/// A CPU-bound task to execute on a worker thread.
+pub const Task = struct {
+    /// Work function executed on a CPU worker thread.
+    ///
+    /// Parameters:
+    ///   - `ctx`: Opaque context pointer (caller-owned, must outlive execution).
+    ///   - `scratch`: FixedBufferAllocator-backed allocator, reset per task.
+    ///                Use for temporary buffers that don't need to outlive the task.
+    ///                Returns error.OutOfMemory if scratch space is exhausted.
+    run_fn: *const fn (ctx: *anyopaque, scratch: std.mem.Allocator) void,
+
+    /// Opaque context pointer passed to `run_fn`.
+    context: *anyopaque,
+
+    /// Optional completion signal.
+    ///
+    /// When non-null, the worker stores 1 (with release ordering) after
+    /// the task completes. The submitter can spin on this value with
+    /// acquire ordering to detect completion.
+    ///
+    /// This is set automatically by `submitAndWait()`. For manual
+    /// fire-and-forget usage via `submit()`, leave as null or provide
+    /// your own atomic flag.
+    completion: ?*std.atomic.Value(u32) = null,
 };
 
-/// Thread pool configuration.
+/// Pool configuration.
 pub const Config = struct {
-    /// Number of worker threads. 0 = auto-detect (CPU count).
+    /// Number of CPU worker threads.
+    /// 0 = auto-detect: max(1, CPU_COUNT / 2).
+    ///
+    /// Rule of thumb: use half the CPU cores for CPU work, leaving
+    /// the other half for I/O runtime threads. This avoids
+    /// oversubscription and keeps connection handling responsive.
     num_threads: u32 = 0,
-    /// Maximum connections waiting in the queue.
-    /// When full, the accept loop blocks (backpressure).
-    max_pending: u32 = 128,
+
+    /// Maximum tasks waiting in the queue before backpressure kicks in.
+    /// When full, submit() blocks until a worker finishes a task.
+    max_pending: u32 = 256,
+
+    /// Scratch buffer size per worker thread (bytes).
+    ///
+    /// Each worker gets a FixedBufferAllocator backed by this much memory.
+    /// Choose based on the largest temporary allocation your CPU tasks need.
+    /// Tasks that exceed this limit receive error.OutOfMemory from the
+    /// scratch allocator and should handle it gracefully.
+    scratch_size: usize = 64 * 1024, // 64 KB default
 };
 
-/// Heap-allocated inner state. Worker threads hold a stable *Inner pointer.
+// ============================================================================
+// Internal state
+// ============================================================================
+
+/// Heap-allocated shared state. Workers hold a stable *Inner pointer.
 const Inner = struct {
-    /// The bounded, thread-safe connection queue.
-    queue: Io.Queue(Job),
+    /// Bounded, thread-safe task queue (Io-aware blocking).
+    queue: Io.Queue(Task),
     /// Backing buffer for the queue.
-    queue_buffer: []Job,
+    queue_buffer: []Task,
     /// Worker thread handles (for joining on shutdown).
     workers: []std.Thread,
-    /// The router shared by all workers.
-    router: *const Router,
-    /// Allocator for per-request arenas.
+    /// Per-worker scratch buffers (heap-allocated once, reused forever).
+    scratch_buffers: [][]u8,
+    /// Allocator for freeing resources on shutdown.
     allocator: std.mem.Allocator,
-    /// I/O context shared across threads.
+    /// I/O context for queue operations.
     io: Io,
 };
 
-/// Pointer to the heap-allocated inner state.
+/// Pointer to heap-allocated inner state.
 inner: *Inner,
-/// Allocator used to free the Inner on shutdown.
+/// Allocator used to free Inner on shutdown.
 allocator: std.mem.Allocator,
 
-/// Initialize the thread pool and spawn worker threads.
+// ============================================================================
+// Lifecycle
+// ============================================================================
+
+/// Initialize the CPU pool and spawn worker threads.
 ///
-/// The inner state is heap-allocated so that worker threads receive a
-/// pointer that remains valid even when the ThreadPool handle is
-/// returned by value from a function.
-pub fn init(
-    allocator: std.mem.Allocator,
-    io: Io,
-    router: *const Router,
-    config: Config,
-) !ThreadPool {
-    // Resolve thread count: 0 = CPU count, minimum 1.
+/// Workers start immediately and block on the empty queue.
+/// The pool is ready for task submission as soon as init() returns.
+pub fn init(allocator: std.mem.Allocator, io: Io, config: Config) !CpuPool {
+    // Resolve thread count: 0 = auto (half of CPU cores, minimum 1).
     const num_threads: u32 = if (config.num_threads > 0)
         config.num_threads
     else blk: {
         const cpu_count = std.Thread.getCpuCount() catch 4;
-        break :blk @intCast(@max(cpu_count, 1));
+        break :blk @intCast(@max(cpu_count / 2, 1));
     };
 
     const max_pending = @max(config.max_pending, num_threads);
 
-    // Allocate the queue backing buffer.
-    const queue_buffer = try allocator.alloc(Job, max_pending);
+    // ---- Allocate resources ----
+
+    const queue_buffer = try allocator.alloc(Task, max_pending);
     errdefer allocator.free(queue_buffer);
 
-    // Allocate thread handle array.
     const workers = try allocator.alloc(std.Thread, num_threads);
     errdefer allocator.free(workers);
 
-    // Heap-allocate the inner state so that &inner is stable.
+    const scratch_buffers = try allocator.alloc([]u8, num_threads);
+    errdefer allocator.free(scratch_buffers);
+
+    // Allocate per-worker scratch buffers.
+    var allocated_scratches: u32 = 0;
+    errdefer {
+        for (scratch_buffers[0..allocated_scratches]) |buf| allocator.free(buf);
+    }
+    for (scratch_buffers) |*buf| {
+        buf.* = try allocator.alloc(u8, config.scratch_size);
+        allocated_scratches += 1;
+    }
+
+    // Heap-allocate Inner so workers get a stable pointer.
     const inner = try allocator.create(Inner);
     errdefer allocator.destroy(inner);
 
     inner.* = .{
-        .queue = Io.Queue(Job).init(queue_buffer),
+        .queue = Io.Queue(Task).init(queue_buffer),
         .queue_buffer = queue_buffer,
         .workers = workers,
-        .router = router,
+        .scratch_buffers = scratch_buffers,
         .allocator = allocator,
         .io = io,
     };
 
-    // Spawn worker threads — they receive *Inner which is heap-stable.
+    // ---- Spawn worker threads ----
+
     var spawned: u32 = 0;
     errdefer {
         inner.queue.close(io);
         for (inner.workers[0..spawned]) |w| w.join();
     }
 
-    for (inner.workers) |*w| {
-        w.* = try std.Thread.spawn(.{}, workerFn, .{inner});
+    for (0..num_threads) |i| {
+        inner.workers[i] = try std.Thread.spawn(.{}, workerFn, .{ inner, inner.scratch_buffers[i] });
         spawned += 1;
     }
 
@@ -129,62 +187,101 @@ pub fn init(
     };
 }
 
-/// Submit a new connection (stream) to the pool.
-///
-/// If the queue is full, this blocks until a worker finishes a previous
-/// connection and takes from the queue (backpressure on the accept loop).
-pub fn submit(self: *ThreadPool, stream: net.Stream) void {
-    self.inner.queue.putOneUncancelable(self.inner.io, .{ .stream = stream }) catch {
-        // Queue is closed (shutting down) — close the stream.
-        stream.close(self.inner.io);
-    };
-}
-
 /// Gracefully shut down the pool.
 ///
-/// Closes the queue (unblocking all waiting workers), then joins
-/// all worker threads.
-pub fn shutdown(self: *ThreadPool, io: Io) void {
+/// 1. Closes the queue (unblocks waiting workers with error.Closed)
+/// 2. Joins all worker threads (waits for current tasks to finish)
+/// 3. Frees all resources (scratch buffers, queue buffer, thread handles)
+pub fn shutdown(self: *CpuPool, io: Io) void {
     const inner = self.inner;
 
     // Signal all workers to stop.
     inner.queue.close(io);
 
-    // Wait for all workers to finish their current connection and exit.
+    // Wait for all workers to finish their current task and exit.
     for (inner.workers) |w| w.join();
 
     // Free resources.
+    for (inner.scratch_buffers) |buf| self.allocator.free(buf);
+    self.allocator.free(inner.scratch_buffers);
     self.allocator.free(inner.workers);
     self.allocator.free(inner.queue_buffer);
     self.allocator.destroy(inner);
 }
 
+// ============================================================================
+// Task submission
+// ============================================================================
+
+/// Submit a task to the pool.
+///
+/// If the queue is full, blocks until a worker finishes and frees a slot
+/// (backpressure). If the pool is shutting down, the task is not executed
+/// but its completion flag is signaled to prevent callers from hanging.
+pub fn submit(self: *CpuPool, task: Task) void {
+    self.inner.queue.putOneUncancelable(self.inner.io, task) catch {
+        // Queue closed (shutting down). Signal completion so caller doesn't hang.
+        if (task.completion) |c| c.store(1, .release);
+    };
+}
+
+/// Submit a task and spin-wait until it completes.
+///
+/// Creates a stack-local completion flag, submits the task, and spins
+/// with `spinLoopHint()` until the worker signals completion.
+///
+/// Suitable for short CPU tasks (< 10ms). For longer tasks, prefer
+/// `submit()` with an explicit completion flag and periodic polling.
+///
+/// On the threaded I/O backend (Windows), this blocks the calling OS
+/// thread. On the evented backend, consider wrapping the call in
+/// `io.async()` to avoid blocking the I/O fiber.
+pub fn submitAndWait(
+    self: *CpuPool,
+    run_fn: *const fn (*anyopaque, std.mem.Allocator) void,
+    context: *anyopaque,
+) void {
+    var done: std.atomic.Value(u32) = .init(0);
+    self.submit(.{
+        .run_fn = run_fn,
+        .context = context,
+        .completion = &done,
+    });
+    // Spin-wait with CPU hint to reduce power consumption.
+    // Maps to PAUSE (x86) / YIELD (ARM) / WFE (ARM64).
+    while (done.load(.acquire) == 0) {
+        std.atomic.spinLoopHint();
+    }
+}
+
+// ============================================================================
+// Worker thread
+// ============================================================================
+
 /// Worker thread entry point.
 ///
-/// Each worker owns a persistent ArenaAllocator that is reset between
-/// requests (O(1) with `.retain_capacity`), avoiding repeated heap
-/// alloc/free through the backing allocator.
+/// Loops forever pulling tasks from the bounded queue. Each task gets a
+/// fresh FixedBufferAllocator over the pre-allocated scratch buffer — the
+/// bump pointer resets to zero between tasks, giving every task the full
+/// scratch capacity with zero overhead.
 ///
-/// The worker loops forever, pulling connections from the queue and
-/// handling them (including the keep-alive request loop). The worker
-/// exits when the queue is closed during shutdown.
-fn workerFn(inner: *Inner) void {
-    // Thread-local arena — lives for the entire lifetime of this worker.
-    // `.retain_capacity` reset between requests reuses memory without syscalls.
-    var arena_state: std.heap.ArenaAllocator = .init(inner.allocator);
-    defer arena_state.deinit();
-
+/// The worker exits when the queue is closed during shutdown.
+fn workerFn(inner: *Inner, scratch_buf: []u8) void {
     while (true) {
-        // Block until a connection is available (or queue is closed).
-        const job = inner.queue.getOneUncancelable(inner.io) catch {
+        // Block until a task is available (or queue is closed → shutdown).
+        const task = inner.queue.getOneUncancelable(inner.io) catch {
             // error.Closed → pool is shutting down.
             break;
         };
 
-        // Handle the full lifecycle of this connection.
-        // Connection.handle runs the keep-alive loop internally,
-        // so one connection may serve many HTTP requests.
-        // The arena is reset (not freed) between each request inside handle().
-        Connection.handle(&arena_state, job.stream, inner.io, inner.router);
+        // Create a fresh FixedBufferAllocator for this task's scratch space.
+        // Re-created each iteration so the bump pointer resets to 0.
+        var fba = std.heap.FixedBufferAllocator.init(scratch_buf);
+
+        // Execute the CPU-bound work.
+        task.run_fn(task.context, fba.allocator());
+
+        // Signal completion if requested.
+        if (task.completion) |c| c.store(1, .release);
     }
 }
