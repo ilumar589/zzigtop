@@ -9,17 +9,23 @@ const mem = std.mem;
 
 /// A parsed HTTP header as zero-copy slices into the original buffer.
 pub const Header = struct {
+    /// Header field name, e.g. `"Content-Type"`.
     name: []const u8,
+    /// Header field value, e.g. `"application/json"`.
     value: []const u8,
 };
 
 /// Result of parsing the HTTP request line.
 pub const RequestLine = struct {
+    /// The HTTP method (GET, POST, PUT, …).
     method: http.Method,
+    /// The raw request-target path, e.g. `"/users/42"`.
     path: []const u8,
+    /// The HTTP version from the request line.
     version: http.Version,
 };
 
+/// Errors that can occur during HTTP/1 request parsing.
 pub const ParseError = error{
     InvalidMethod,
     InvalidPath,

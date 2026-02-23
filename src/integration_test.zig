@@ -116,6 +116,7 @@ var tests_passed: u32 = 0;
 var tests_failed: u32 = 0;
 var tests_total: u32 = 0;
 
+/// Log a test result and update the pass/fail counters.
 fn reportResult(name: []const u8, passed: bool, detail: []const u8) void {
     tests_total += 1;
     if (passed) {
@@ -181,6 +182,7 @@ fn sendRequest(io: Io, request_bytes: []const u8, buf: []u8) ![]const u8 {
     return buf[0..total];
 }
 
+/// Parse the `Content-Length` value from raw HTTP headers.
 fn findContentLength(headers: []const u8) ?usize {
     // Simple scan for "content-length: <num>"
     var i: usize = 0;
@@ -244,6 +246,7 @@ fn expectHeaderContains(response: []const u8, header_name: []const u8, expected_
 // Integration Tests
 // ============================================================================
 
+/// Run the core HTTP integration tests (routes, status codes, headers, bodies).
 fn runTests(io: Io) void {
     var buf: [16384]u8 = undefined;
 
@@ -481,6 +484,7 @@ fn sendScRequest(io: Io, request_bytes: []const u8, buf: []u8) ![]const u8 {
     return buf[0..total];
 }
 
+/// Run structured-concurrency integration tests (timeouts, fan-out, cancellation).
 fn runScTests(io: Io) void {
     var buf: [16384]u8 = undefined;
 
@@ -615,6 +619,7 @@ fn runScTests(io: Io) void {
 // Entry point
 // ============================================================================
 
+/// Integration test entry point — starts the server, runs all test suites, and exits.
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
 

@@ -15,6 +15,7 @@ pub fn printAnotherMessage(writer: *Io.Writer) Io.Writer.Error!void {
     try writer.print("Run `zig build test` to run the tests.\n", .{});
 }
 
+/// Add two 32-bit integers (scaffolding example used by `build.zig` tests).
 pub fn add(a: i32, b: i32) i32 {
     return a + b;
 }

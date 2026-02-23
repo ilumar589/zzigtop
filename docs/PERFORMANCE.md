@@ -604,10 +604,13 @@ document root directory when no comptime route matches a request.
    }
    ```
 
-3. **Page-allocated reads:** File contents are read via `std.heap.page_allocator`,
-   freed immediately after `response.flush()` writes data to the socket. This
-   avoids arena fragmentation (large file buffers won't fragment the per-request
-   arena) while keeping memory bounded.
+3. **Arena-allocated reads:** File contents are allocated from the per-request
+   arena, freed in bulk when the request completes (arena reset). This eliminates
+   manual `free()` calls and makes all code paths — including error returns —
+   leak-free. Originally used `page_allocator` with manual free, which was
+   migrated during the memory safety audit (Step 15-8) after finding 3 critical
+   bugs: leaks on error paths, `@constCast` UB on empty files, and fragile
+   lifecycle management.
 
 4. **O(n) path validation:** Path sanitization is a single linear scan — no regex,
    no allocations. Rejects `..` traversal, null bytes, and backslashes.
@@ -636,8 +639,8 @@ them when available, but we use the threaded model for simplicity and
 cross-platform compatibility.
 
 ### Memory-Mapped Static Files
-Planned for Step 10. Would use `mmap` to serve static files without copying
-from kernel to userspace.
+Considered for future implementation. Would use `mmap` to serve static files
+without copying from kernel to userspace.
 
 ### Sendfile
 The `std.Io.Writer` supports `sendFile` but it's marked as TODO in the

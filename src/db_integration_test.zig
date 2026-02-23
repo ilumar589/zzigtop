@@ -23,6 +23,7 @@ var tests_passed: u32 = 0;
 var tests_failed: u32 = 0;
 var tests_total: u32 = 0;
 
+/// Log a test result and update the pass/fail counters.
 fn reportResult(name: []const u8, passed: bool, detail: []const u8) void {
     tests_total += 1;
     if (passed) {
@@ -38,6 +39,7 @@ fn reportResult(name: []const u8, passed: bool, detail: []const u8) void {
 // Tests
 // ============================================================================
 
+/// Run all database integration tests (CRUD, constraints, SQL-injection safety).
 fn runTests(database: *db.Database, arena: std.mem.Allocator) void {
     // --- Test 1: Database connection — pool init/deinit ---
     // If we got here, init succeeded. Just verify we can acquire/release a conn.
@@ -262,6 +264,7 @@ fn runTests(database: *db.Database, arena: std.mem.Allocator) void {
 // Entry point
 // ============================================================================
 
+/// Database integration test entry point — connects to PostgreSQL, runs tests, and exits.
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const arena = init.arena.allocator();

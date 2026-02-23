@@ -28,6 +28,7 @@ pub const HandlerFn = *const fn (*Request, *Response, Io) anyerror!void;
 
 /// A single compiled route entry.
 pub const Route = struct {
+    /// HTTP method this route matches.
     method: http.Method,
     /// The pattern string, e.g., "/users/:id/posts"
     pattern: []const u8,
@@ -55,7 +56,9 @@ routes: []const Route,
 
 /// Result of a successful route match.
 pub const Match = struct {
+    /// The handler function for the matched route.
     handler: HandlerFn,
+    /// Captured path parameters (e.g. `:id` → `"42"`).
     params: []const Request.Param,
 };
 

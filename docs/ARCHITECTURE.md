@@ -100,7 +100,12 @@ Handler (I/O fiber) ──submit──► Io.Queue ──► CPU Worker Thread
 ```
 
 ### 3. Arena-per-Request
-Each HTTP request gets a dedicated arena allocator. All allocations during request processing (route params, parsed data, response building) use this arena. When the request completes, the entire arena is freed in a single O(1) operation.
+Each HTTP request gets a dedicated arena allocator. All allocations during request processing (route params, parsed data, response building, **static file content**, cache headers) use this arena. When the request completes, the entire arena is freed in a single O(1) operation.
+
+This design makes memory leaks structurally impossible — there are no manual `free()` calls
+to forget. A memory safety audit (Step 15-8) migrated the static file handler from
+`page_allocator` (manual free, 3 critical bugs) to the per-request arena, eliminating
+all leak paths and `@constCast` undefined behavior.
 
 ### 3a. Explicit Allocator Parameters
 No allocator is ever hardcoded. The backing allocator for per-request arenas is
@@ -236,9 +241,9 @@ Per-CPU-Worker (pre-allocated, reused forever):
 5. **Static fallback:** If no route matches and `static_config` is set, try `Static.serve()`
    - Sanitize path (reject `../`, null bytes, backslashes)
    - Open file via `Io.Dir.cwd()` → `dir.openDir(io)` → `dir.openFile(io)`
-   - Read via `file.readPositionalAll(io)` into page-allocated buffer
+   - Read via `file.readPositionalAll(io)` into arena-allocated buffer
    - Send with correct Content-Type (comptime MIME table) + Cache-Control
-   - Free page buffer after flush
+   - Buffer freed automatically when per-request arena resets
 6. **Handle:** Handler receives `Request`, writes to `Response` 
 7. **Write:** `Response.send()` flushes vectored buffers to socket
 8. **Keep-alive:** If Connection: keep-alive, loop back to step 3

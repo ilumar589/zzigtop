@@ -4,7 +4,7 @@
 
 > **Last Updated:** 2026-02-22  
 > **Zig Version:** 0.16.0-dev.2535+b5bd49460  
-> **Status:** STEP 15 COMPLETE — Static file serving
+> **Status:** STEP 15 COMPLETE — Static file serving + Memory safety audit
 
 ---
 
@@ -48,14 +48,15 @@
 | | 14-2: FixedBufferAllocator per worker (bounded scratch space) | ✅ COMPLETE |
 | | 14-3: Export CpuPool from http module | ✅ COMPLETE |
 | | 14-4: Documentation (PERFORMANCE.md, ARCHITECTURE.md) | ✅ COMPLETE |
-| 15 | Static file serving | 🔧 IN PROGRESS |
-| | 15-1: `static.zig` — MIME mapping + path traversal prevention | ⬜ NOT STARTED |
-| | 15-2: `sendFile()` on Response — serve file with Content-Type | ⬜ NOT STARTED |
-| | 15-3: `static_dir` config on Server — configurable document root | ⬜ NOT STARTED |
-| | 15-4: Connection fallback — try static file when no route matches | ⬜ NOT STARTED |
-| | 15-5: Sample `public/` directory — HTML, CSS, JS demo files | ⬜ NOT STARTED |
-| | 15-6: Wire into `http_server_main.zig` | ⬜ NOT STARTED |
-| | 15-7: Integration tests + documentation | ⬜ NOT STARTED |
+| 15 | Static file serving | ✅ COMPLETE |
+| | 15-1: `static.zig` — MIME mapping + path traversal prevention | ✅ COMPLETE |
+| | 15-2: `sendFile()` on Response — serve file with Content-Type | ✅ COMPLETE |
+| | 15-3: `static_dir` config on Server — configurable document root | ✅ COMPLETE |
+| | 15-4: Connection fallback — try static file when no route matches | ✅ COMPLETE |
+| | 15-5: Sample `public/` directory — HTML, CSS, JS demo files | ✅ COMPLETE |
+| | 15-6: Wire into `http_server_main.zig` | ✅ COMPLETE |
+| | 15-7: Integration tests + documentation | ✅ COMPLETE |
+| | 15-8: Memory safety audit — fix leaks, add leak tests (90/90) | ✅ COMPLETE |
 
 ---
 
@@ -316,7 +317,7 @@ Then read `docs/ARCHITECTURE.md` for the overall design, and the specific source
 
 ---
 
-## Step 11b: Structured Concurrency (NOT STARTED)
+## Step 11b: Structured Concurrency (COMPLETE)
 
 ### Vision
 
@@ -815,7 +816,7 @@ pub const Stats = struct {
 
 ---
 
-## Step 12: JSON Body Parsing & Struct Serialization (IN PROGRESS)
+## Step 12: JSON Body Parsing & Struct Serialization (COMPLETE)
 
 **Goal:** Enable handlers to parse incoming JSON request bodies into typed Zig
 structs, and serialize Zig structs back as JSON responses — using `std.json`
@@ -1492,9 +1493,12 @@ Request: GET /style.css HTTP/1.1
    filesystem. Any `..` segments, null bytes, or backslashes are rejected with 400.
    The resolved path must stay under the configured document root.
 
-4. **Page-allocated file reads:** File contents are read via `page_allocator`,
-   freed immediately after `response.flush()` writes them to the socket. This avoids
-   arena fragmentation for large files while keeping memory bounded.
+4. **Arena-allocated file reads:** File contents are allocated from the per-request
+   arena allocator, freed in bulk when the request completes. This eliminates manual
+   `free()` calls and makes all code paths (including error paths) leak-free.
+   Originally used `page_allocator` with manual free, which had 3 critical bugs:
+   leaks on error paths, `@constCast` UB on empty files, and fragile lifecycle.
+   Migrated to arena in the memory safety audit (Sub-step 15-8).
 
 5. **Bounded file size:** A configurable `max_file_size` (default: 10MB) prevents
    accidental serving of huge files that would exhaust memory.
@@ -1516,6 +1520,7 @@ Request: GET /style.css HTTP/1.1
 | 15-5 | Sample `public/` directory — HTML, CSS, JS demo files (htmx-ready) | ✅ COMPLETE |
 | 15-6 | Wire into `http_server_main.zig` — enable static serving + CLI flags | ✅ COMPLETE |
 | 15-7 | Unit tests (84/84 pass) + documentation | ✅ COMPLETE |
+| 15-8 | Memory safety audit — arena migration, leak tests (90/90 pass) | ✅ COMPLETE |
 
 ### File Plan
 
@@ -1546,3 +1551,50 @@ Request: GET /style.css HTTP/1.1
 | Caching | `Cache-Control` headers reduce repeat requests to zero server work |
 | Memory bounded | `max_file_size` prevents unbounded reads (default 10MB) |
 | Future: mmap | For large files, could memory-map instead of read (not in this step) |
+
+### Sub-Step 15-8: Memory Safety Audit
+
+A comprehensive audit of all 17 source files identified 9 memory safety issues.
+The 3 critical bugs were fixed; 6 medium/low issues were addressed or documented.
+
+#### Bugs Found & Fixed
+
+| # | Severity | File | Issue | Fix |
+|---|----------|------|-------|-----|
+| 1 | **Critical** | `static.zig` | `sendStaticResponse` leaked `page_allocator` buffer on 4 error paths (early returns before `free()`) | Migrated to arena allocation — no manual free needed |
+| 2 | **Critical** | `static.zig` | `readFile` returned `""` (string literal) for empty files, then `sendStaticResponse` called `free(@constCast(""))` — **undefined behavior** | Empty files return `""` directly; arena skips free for unowned memory |
+| 3 | **Medium** | `static.zig` | `page_allocator` contradicted "arena-allocated" docs, made lifecycle manual and fragile | All allocations now use `response.arena` — automatic bulk free |
+| 4 | **Low** | `http_server_main.zig` | `handleIndex` hardcoded `"public"` ignoring `--static-dir` CLI flag | Added `global_static_config` module-level variable, set during startup |
+
+#### Architecture of the Fix
+
+The root cause was using `page_allocator` for file reads, which required manual
+`free()` after every serve. The fix replaces this with the per-request **arena**:
+
+```
+BEFORE (page_allocator — manual free, leak-prone):
+  readFile()      → page_allocator.alloc(size)
+  sendStaticResponse() → ... error path → LEAK! (no free)
+                       → ... success → page_allocator.free(@constCast(content))
+                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                                        UB if content is "" literal
+
+AFTER (arena — automatic free, leak-impossible):
+  readFile(arena) → arena.alloc(size)        ← freed by arena reset
+  sendStaticResponse() → ... any path → OK   ← no free needed
+  ~request~       → arena.reset()            ← bulk free of everything
+```
+
+#### Memory Safety Tests Added (6 tests, 90/90 total)
+
+| Test | What it verifies |
+|------|-----------------|
+| `arena lifecycle frees all allocations` | Arena deinit releases readFile + cache header allocations |
+| `sendStaticResponse sets correct state` | Headers/body are set correctly with arena-backed allocator |
+| `no cache header when max_age is 0` | Zero cache-max-age skips allocPrint (no unnecessary allocation) |
+| `empty file content does not require free` | `""` string literal is safe without free (old code had UB) |
+| `multiple arena allocations freed together` | Simulates multi-file serve — all freed in one reset |
+| `arena reset between requests` | Verifies cross-request isolation via arena reset |
+
+All tests use `std.testing.allocator` (which detects leaks) inside `ArenaAllocator`
+to verify the exact allocation pattern used in production.

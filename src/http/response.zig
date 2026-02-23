@@ -26,6 +26,7 @@ body: []const u8 = "",
 
 /// Extra headers storage (fixed-size, no allocation).
 extra_header_buf: [max_extra_headers]http.Header = undefined,
+/// Number of extra response headers currently set.
 extra_header_count: usize = 0,
 
 /// Arena allocator for response-lifetime allocations.

@@ -12,16 +12,22 @@
 const std = @import("std");
 const pg = @import("pg");
 
+/// pg.zig connection pool (manages async connections).
 pub const Pool = pg.Pool;
+/// A single borrowed database connection.
 pub const Conn = pg.Conn;
+/// Query result set — call `next()` to iterate rows.
 pub const Result = pg.Result;
+/// A single result row with column accessors.
 pub const Row = pg.Row;
+/// A row from a single-column query.
 pub const QueryRow = pg.QueryRow;
 
 const Io = std.Io;
 
 const Database = @This();
 
+/// The underlying pg.zig connection pool.
 pool: *pg.Pool,
 
 /// Database connection configuration.

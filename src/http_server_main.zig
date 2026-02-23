@@ -37,6 +37,12 @@ var server_stats: ?*http.Server.Stats = null;
 /// Used by `/api/users` handlers. Null if `--no-db` flag is passed.
 var global_db: ?*db.Database = null;
 
+/// Module-level static file config (set once during startup).
+/// Used by handleIndex to serve index.html from the correct directory.
+/// Null if `--no-static` flag is passed.
+var global_static_config: ?http.Static.Config = null;
+
+/// HTTP server entry point — parses CLI flags, starts the server, and blocks.
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const arena: std.mem.Allocator = init.arena.allocator();
@@ -120,6 +126,7 @@ pub fn main(init: std.process.Init) !void {
         global_db = null;
     };
     server_stats = &server.stats;
+    global_static_config = static_config;
 
     // Run the accept loop — returns when shutdown is requested.
     // On graceful shutdown, run() returns error.Canceled.
@@ -134,11 +141,13 @@ pub fn main(init: std.process.Init) !void {
 // Request Handlers
 // ============================================================================
 
-/// GET / — Serve the static index.html dashboard page
+/// GET / — Serve the static index.html dashboard page.
+/// Uses the global static config (respects --static-dir CLI flag).
 fn handleIndex(_: *http.Request, response: *http.Response, io: std.Io) anyerror!void {
-    if (!response.sendStaticFile(.{ .root_dir = "public" }, "/index.html", io)) {
-        try response.sendText(.not_found, "index.html not found");
+    if (global_static_config) |sc| {
+        if (response.sendStaticFile(sc, "/index.html", io)) return;
     }
+    try response.sendText(.not_found, "index.html not found");
 }
 
 /// GET /health — Health check endpoint

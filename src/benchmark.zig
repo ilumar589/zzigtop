@@ -73,6 +73,7 @@ const benchmarks = [_]BenchConfig{
 // Benchmark worker
 // ============================================================================
 
+/// Aggregated latency/throughput results from a single benchmark worker.
 const WorkerResult = struct {
     successful: u64 = 0,
     failed: u64 = 0,
@@ -227,6 +228,7 @@ fn findContentLengthInHeaders(headers: []const u8) ?usize {
     return null;
 }
 
+/// Run a full benchmark pass: spawn worker threads, collect results, print stats.
 fn runBenchmark(io: Io, config: BenchConfig) void {
     std.debug.print("  {s}\n", .{config.name});
     std.debug.print("    Threads: {d}, Requests/thread: {d}, Total: {d}\n", .{
@@ -299,6 +301,7 @@ fn runBenchmark(io: Io, config: BenchConfig) void {
     std.debug.print("\n", .{});
 }
 
+/// Format a nanosecond duration into a human-readable string (e.g. "12.34ms").
 fn formatDurationBuf(ns: u64, buf: []u8) []const u8 {
     if (ns >= 1_000_000_000) {
         return std.fmt.bufPrint(buf, "{d:.2}s", .{@as(f64, @floatFromInt(ns)) / 1_000_000_000.0}) catch "?";
@@ -315,6 +318,7 @@ fn formatDurationBuf(ns: u64, buf: []u8) []const u8 {
 // Entry point
 // ============================================================================
 
+/// Benchmark entry point — starts the server, runs all benchmark passes, and prints a summary.
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
 
