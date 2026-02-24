@@ -166,7 +166,6 @@ $endpoints = @("/health", "/", "/json", "/hello/bench")
 
 # Throughput tracking
 $throughputSamples = [System.Collections.ArrayList]::new()
-$globalSw = [System.Diagnostics.Stopwatch]::StartNew()
 $totalRequests = 0
 $totalErrors   = 0
 
@@ -174,6 +173,40 @@ Write-Phase "Starting load generation ($Duration s, max concurrency $MaxConcurre
 Write-Host ""
 
 Add-Type -AssemblyName System.Net.Http
+
+# --- Create a SINGLE HttpClient for the entire benchmark ---
+# Re-creating HttpClient per batch causes socket exhaustion (TIME_WAIT)
+# and kills throughput. One long-lived client reuses TCP connections via
+# HTTP keep-alive, which is how real traffic works.
+$globalHandler = [System.Net.Http.HttpClientHandler]::new()
+$globalHandler.MaxConnectionsPerServer = [math]::Max($MaxConcurrency, 256)
+# Allow connection pooling and keep-alive
+$globalHandler.UseProxy = $false
+$globalClient = [System.Net.Http.HttpClient]::new($globalHandler)
+$globalClient.Timeout = [TimeSpan]::FromSeconds(10)
+# Pre-set a default request header to signal keep-alive
+$globalClient.DefaultRequestHeaders.ConnectionClose = $false
+
+# --- Warmup: prime the connection pool before measurement ---
+Write-Phase "Warmup (priming connection pool)..."
+$warmupTasks = [System.Collections.Generic.List[System.Threading.Tasks.Task[System.Net.Http.HttpResponseMessage]]]::new(20)
+for ($w = 0; $w -lt 20; $w++) {
+    $ep = $endpoints[$w % $endpoints.Count]
+    $warmupTasks.Add($globalClient.GetAsync("$baseUrl$ep"))
+}
+try { [System.Threading.Tasks.Task]::WaitAll($warmupTasks.ToArray(), 10000) } catch {}
+foreach ($wt in $warmupTasks) {
+    if ($wt.Status -eq "RanToCompletion" -and $null -ne $wt.Result) {
+        try { [void]$wt.Result.Content.ReadAsByteArrayAsync().Result } catch {}
+        $wt.Result.Dispose()
+    }
+    $wt.Dispose()
+}
+Write-Host "  [OK] Warmup complete" -ForegroundColor Green
+Write-Host ""
+
+# Start the global clock AFTER warmup
+$globalSw = [System.Diagnostics.Stopwatch]::StartNew()
 
 foreach ($phase in $phases) {
     $conc = $phase.Concurrency
@@ -192,37 +225,33 @@ foreach ($phase in $phases) {
     $sampleRequests = 0
 
     while ($phaseEnd.Elapsed.TotalSeconds -lt $secs) {
-        # Fire a batch of concurrent requests
-        $handler = [System.Net.Http.HttpClientHandler]::new()
-        $handler.MaxConnectionsPerServer = $conc
-        $client = [System.Net.Http.HttpClient]::new($handler)
-        $client.Timeout = [TimeSpan]::FromSeconds(5)
-
-        $tasks = @()
+        # Fire a batch of concurrent requests (reusing the shared HttpClient)
+        $tasks = [System.Collections.Generic.List[System.Threading.Tasks.Task[System.Net.Http.HttpResponseMessage]]]::new($conc)
         for ($i = 0; $i -lt $conc; $i++) {
             $ep = $endpoints[$i % $endpoints.Count]
-            $tasks += $client.GetAsync("$baseUrl$ep")
+            $tasks.Add($globalClient.GetAsync("$baseUrl$ep"))
         }
 
         try {
-            [System.Threading.Tasks.Task]::WaitAll($tasks, 10000)
+            [System.Threading.Tasks.Task]::WaitAll($tasks.ToArray(), 15000)
         } catch {}
 
         foreach ($task in $tasks) {
-            if ($task.Status -eq "RanToCompletion" -and $task.Result.IsSuccessStatusCode) {
-                $phaseRequests++
-                $sampleRequests++
+            if ($task.Status -eq "RanToCompletion" -and $null -ne $task.Result) {
+                # Drain the response body so the connection can be reused (keep-alive)
+                try { [void]$task.Result.Content.ReadAsByteArrayAsync().Result } catch {}
+                if ($task.Result.IsSuccessStatusCode) {
+                    $phaseRequests++
+                    $sampleRequests++
+                } else {
+                    $phaseErrors++
+                }
+                $task.Result.Dispose()
             } else {
                 $phaseErrors++
             }
-            if ($null -ne $task.Result) {
-                $task.Result.Dispose()
-            }
             $task.Dispose()
         }
-
-        $client.Dispose()
-        $handler.Dispose()
 
         # Record throughput sample every ~1 second
         $now = $globalSw.Elapsed.TotalSeconds
@@ -238,9 +267,27 @@ foreach ($phase in $phases) {
         }
     }
 
+    # Flush the final sub-second throughput bucket for this phase
+    if ($sampleRequests -gt 0) {
+        $now = $globalSw.Elapsed.TotalSeconds
+        $dt = $now - $lastSampleTime
+        if ($dt -gt 0.1) {
+            $rps = $sampleRequests / $dt
+            [void]$throughputSamples.Add(@{
+                t           = [math]::Round($now, 2)
+                rps         = [math]::Round($rps, 1)
+                concurrency = $conc
+            })
+        }
+    }
+
     $totalRequests += $phaseRequests
     $totalErrors   += $phaseErrors
 }
+
+# Clean up the shared HttpClient
+$globalClient.Dispose()
+$globalHandler.Dispose()
 
 $globalSw.Stop()
 $totalWallSecs = $globalSw.Elapsed.TotalSeconds
