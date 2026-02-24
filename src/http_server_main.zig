@@ -62,6 +62,9 @@ pub fn main(init: std.process.Init) !void {
     var db_port: u16 = 5432;
     var static_dir: []const u8 = "public";
     var no_static = false;
+    var idle_timeout_s: u32 = 30;
+    var request_timeout_s: u32 = 10;
+    var backlog: u31 = 128;
     const args = try init.minimal.args.toSlice(arena);
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -80,6 +83,15 @@ pub fn main(init: std.process.Init) !void {
             i += 1;
         } else if (std.mem.eql(u8, args[i], "--db-port") and i + 1 < args.len) {
             db_port = std.fmt.parseInt(u16, args[i + 1], 10) catch 5432;
+            i += 1;
+        } else if (std.mem.eql(u8, args[i], "--idle-timeout") and i + 1 < args.len) {
+            idle_timeout_s = std.fmt.parseInt(u32, args[i + 1], 10) catch 30;
+            i += 1;
+        } else if (std.mem.eql(u8, args[i], "--request-timeout") and i + 1 < args.len) {
+            request_timeout_s = std.fmt.parseInt(u32, args[i + 1], 10) catch 10;
+            i += 1;
+        } else if (std.mem.eql(u8, args[i], "--backlog") and i + 1 < args.len) {
+            backlog = std.fmt.parseInt(u31, args[i + 1], 10) catch 128;
             i += 1;
         }
     }
@@ -126,6 +138,9 @@ pub fn main(init: std.process.Init) !void {
         .port = port,
         .router = &router,
         .reuse_address = true,
+        .backlog = backlog,
+        .idle_timeout_s = idle_timeout_s,
+        .request_timeout_s = request_timeout_s,
         .static_config = static_config,
     });
     defer server.deinit(io);

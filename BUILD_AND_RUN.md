@@ -283,3 +283,96 @@ default browser. It includes:
 - **Throughput chart** — requests/sec with concurrency overlay
 - **Threads & handles chart** — OS thread and handle count over time
 - **Combined overview** — normalized CPU, RAM, and RPS on a single chart
+
+---
+
+## Docker Benchmark (Linux + wrk)
+
+For production-grade benchmarks, the project includes a Docker Compose setup that
+runs the Zig server **on Linux** (enabling the io_uring / epoll async backend) and
+benchmarks it with **wrk** — the same tool used by the TechEmpower Framework
+Benchmarks. This eliminates Windows and PowerShell HttpClient as bottlenecks.
+
+### Architecture
+
+| Container | Image | Description |
+|-----------|-------|-------------|
+| **postgres** | `postgres:16` | PostgreSQL with seed data |
+| **server** | Alpine + Zig ReleaseFast | HTTP server with io_uring backend |
+| **bench** | Alpine + wrk (compiled from source) | 7-phase benchmark with HTTP pipelining |
+
+### Quick Start
+
+```powershell
+# Run the full benchmark (no database tests)
+.\run-bench.ps1
+
+# Include database endpoint tests
+.\run-bench.ps1 -Profile bench-db
+
+# Longer test phases (15s each) with forced rebuild
+.\run-bench.ps1 -Duration 15 -Build
+
+# Tear down everything when done
+.\run-bench.ps1 -Down
+```
+
+### Parameters
+
+| Parameter   | Description                                        | Default  |
+|-------------|----------------------------------------------------|----------|
+| `-Profile`  | `bench` (no DB tests) or `bench-db` (with DB)     | `bench`  |
+| `-Duration` | Duration per wrk test phase in seconds             | `10`     |
+| `-Pipeline` | HTTP pipelining depth (TechEmpower uses 16)        | `16`     |
+| `-Build`    | Force a fresh Docker image rebuild                 | off      |
+| `-Down`     | Tear down all containers and volumes, then exit    | off      |
+
+### What Gets Benchmarked
+
+The benchmark runs 7 phases:
+
+| Phase | Endpoint | Connections | Description |
+|-------|----------|-------------|-------------|
+| 1. Plaintext (pipelined) | `/health` | 16 → 256 | Raw throughput with 16x HTTP pipelining |
+| 2. Plaintext (no pipeline) | `/health` | 16 → 256 | Single-request-per-write throughput |
+| 3. JSON | `/metrics` | 16 → 128 | JSON serialization |
+| 4. Dynamic | `/hello/bench` | 16 → 128 | Route parameter handling + allocPrint |
+| 5. Query params | `/search?q=...` | 16 → 128 | URL parsing + query string |
+| 6. Database | `/api/users` | 16 → 64 | Full DB round-trip (bench-db only) |
+| 7. Latency | `/health` | 1 + 10 | Latency profile (no pipelining, `--latency`) |
+
+### Sample Results (Docker Desktop, 16 CPU cores)
+
+| Test | Connections | Requests/sec | Avg Latency |
+|------|-------------|-------------:|-------------|
+| Plaintext pipelined | 16 | **2,463,200** | 82 μs |
+| Plaintext pipelined | 128 | 950,993 | — |
+| Plaintext no-pipeline | 16 | 413,046 | 95 μs |
+| JSON /metrics | 16 | 13,543 | 22 ms |
+| Dynamic /hello/bench | 16 | 5,478 | 25 ms |
+| Query /search | 16 | 17,529 | 20 ms |
+| Latency (1 conn) | 1 | 21,852 | p50=42μs p99=79μs |
+| Latency (10 conn) | 10 | 119,171 | p50=77μs p99=106μs |
+
+> **Note:** TechEmpower uses 28-core dedicated hardware + 10GbE. Docker Desktop
+> results will be lower but proportionally comparable.
+
+### Manual Docker Compose Usage
+
+```powershell
+# Build and run benchmark without the PowerShell wrapper
+docker compose -f docker/compose.yml --profile bench up --build --abort-on-container-exit
+
+# Just start the server + database (no benchmark)
+docker compose -f docker/compose.yml --profile server up -d --build
+
+# View benchmark results after the run
+docker compose -f docker/compose.yml --profile bench logs bench
+docker compose -f docker/compose.yml --profile bench-db logs bench-db
+
+# View server logs
+docker compose -f docker/compose.yml --profile server logs server -f
+
+# Check server health
+curl http://localhost:8080/health
+```

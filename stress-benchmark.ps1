@@ -75,7 +75,7 @@ if (-not (Test-Path $serverExe)) {
 Write-Phase "Starting server on port $Port..."
 
 $serverProc = Start-Process -FilePath $serverExe `
-    -ArgumentList "--port", $Port, "--no-db" `
+    -ArgumentList "--port", $Port, "--no-db", "--no-static", "--idle-timeout", "0", "--request-timeout", "0", "--backlog", "1024" `
     -PassThru -WindowStyle Hidden
 
 Start-Sleep -Seconds 1
@@ -162,12 +162,18 @@ foreach ($c in $rampSteps) {
 $phases += @{ Concurrency = $MaxConcurrency; Seconds = $sustainDuration }
 
 $baseUrl = "http://127.0.0.1:$Port"
-$endpoints = @("/health", "/", "/json", "/hello/bench")
+# Only hit endpoints that actually exist and are fast (no file I/O).
+# /json was removed — it never existed and returned 404 (counted as error).
+# / was removed — it serves index.html via file I/O (not a fair CPU benchmark).
+$endpoints = @("/health", "/hello/bench", "/metrics", "/search?q=stress&page=1")
 
 # Throughput tracking
 $throughputSamples = [System.Collections.ArrayList]::new()
 $totalRequests = 0
 $totalErrors   = 0
+$errorTimeouts = 0
+$errorConnRefused = 0
+$errorHttpStatus = 0
 
 Write-Phase "Starting load generation ($Duration s, max concurrency $MaxConcurrency)..."
 Write-Host ""
@@ -175,32 +181,29 @@ Write-Host ""
 Add-Type -AssemblyName System.Net.Http
 
 # --- Create a SINGLE HttpClient for the entire benchmark ---
-# Re-creating HttpClient per batch causes socket exhaustion (TIME_WAIT)
-# and kills throughput. One long-lived client reuses TCP connections via
-# HTTP keep-alive, which is how real traffic works.
 $globalHandler = [System.Net.Http.HttpClientHandler]::new()
-$globalHandler.MaxConnectionsPerServer = [math]::Max($MaxConcurrency, 256)
-# Allow connection pooling and keep-alive
+$globalHandler.MaxConnectionsPerServer = [math]::Max($MaxConcurrency, 512)
 $globalHandler.UseProxy = $false
 $globalClient = [System.Net.Http.HttpClient]::new($globalHandler)
-$globalClient.Timeout = [TimeSpan]::FromSeconds(10)
-# Pre-set a default request header to signal keep-alive
-$globalClient.DefaultRequestHeaders.ConnectionClose = $false
+$globalClient.Timeout = [TimeSpan]::FromSeconds(3)
+# Connection: close — prevents thread starvation on the Windows threaded backend.
+# With keep-alive, idle connections hold server threads in receiveHead() waiting for
+# the next request. At 200 concurrency with only ~16 OS threads, nearly all connections
+# get stuck. Connection: close frees the server thread immediately after each response,
+# allowing the thread pool to service the next request.
+$globalClient.DefaultRequestHeaders.ConnectionClose = $true
 
 # --- Warmup: prime the connection pool before measurement ---
-Write-Phase "Warmup (priming connection pool)..."
-$warmupTasks = [System.Collections.Generic.List[System.Threading.Tasks.Task[System.Net.Http.HttpResponseMessage]]]::new(20)
+Write-Phase "Warmup (20 sequential requests)..."
 for ($w = 0; $w -lt 20; $w++) {
     $ep = $endpoints[$w % $endpoints.Count]
-    $warmupTasks.Add($globalClient.GetAsync("$baseUrl$ep"))
-}
-try { [System.Threading.Tasks.Task]::WaitAll($warmupTasks.ToArray(), 10000) } catch {}
-foreach ($wt in $warmupTasks) {
-    if ($wt.Status -eq "RanToCompletion" -and $null -ne $wt.Result) {
-        try { [void]$wt.Result.Content.ReadAsByteArrayAsync().Result } catch {}
-        $wt.Result.Dispose()
-    }
-    $wt.Dispose()
+    try {
+        $resp = $globalClient.GetAsync("$baseUrl$ep").Result
+        if ($null -ne $resp) {
+            try { [void]$resp.Content.ReadAsByteArrayAsync().Result } catch {}
+            $resp.Dispose()
+        }
+    } catch {}
 }
 Write-Host "  [OK] Warmup complete" -ForegroundColor Green
 Write-Host ""
@@ -224,34 +227,75 @@ foreach ($phase in $phases) {
     $lastSampleTime = $globalSw.Elapsed.TotalSeconds
     $sampleRequests = 0
 
-    while ($phaseEnd.Elapsed.TotalSeconds -lt $secs) {
-        # Fire a batch of concurrent requests (reusing the shared HttpClient)
-        $tasks = [System.Collections.Generic.List[System.Threading.Tasks.Task[System.Net.Http.HttpResponseMessage]]]::new($conc)
-        for ($i = 0; $i -lt $conc; $i++) {
-            $ep = $endpoints[$i % $endpoints.Count]
-            $tasks.Add($globalClient.GetAsync("$baseUrl$ep"))
-        }
+    # --- Sliding window: maintain exactly $conc requests in flight ---
+    # Instead of batch-and-wait (fire N, WaitAll, repeat), we use WaitAny:
+    # as soon as ONE request completes, we immediately fire a replacement.
+    # This keeps the pipeline fully saturated with zero dead time.
+    $reqIdx = 0
+    $activeTasks = New-Object 'System.Collections.Generic.List[System.Threading.Tasks.Task[System.Net.Http.HttpResponseMessage]]'
 
+    # Seed the initial batch
+    for ($i = 0; $i -lt $conc; $i++) {
+        $ep = $endpoints[$reqIdx % $endpoints.Count]
+        $reqIdx++
+        $activeTasks.Add($globalClient.GetAsync("$baseUrl$ep"))
+    }
+
+    while ($phaseEnd.Elapsed.TotalSeconds -lt $secs) {
+        # Wait for ANY task to complete (not all — this is the key difference)
+        $completedIdx = -1
         try {
-            [System.Threading.Tasks.Task]::WaitAll($tasks.ToArray(), 15000)
+            $completedIdx = [System.Threading.Tasks.Task]::WaitAny($activeTasks.ToArray(), 5000)
         } catch {}
 
-        foreach ($task in $tasks) {
-            if ($task.Status -eq "RanToCompletion" -and $null -ne $task.Result) {
-                # Drain the response body so the connection can be reused (keep-alive)
-                try { [void]$task.Result.Content.ReadAsByteArrayAsync().Result } catch {}
-                if ($task.Result.IsSuccessStatusCode) {
-                    $phaseRequests++
-                    $sampleRequests++
-                } else {
-                    $phaseErrors++
-                }
-                $task.Result.Dispose()
+        if ($completedIdx -eq -1) {
+            # All tasks timed out at WaitAny level — cancel and restart
+            for ($di = 0; $di -lt $activeTasks.Count; $di++) {
+                $phaseErrors++
+                $errorTimeouts++
+                try { $activeTasks[$di].Dispose() } catch {}
+            }
+            $activeTasks.Clear()
+            for ($i = 0; $i -lt $conc; $i++) {
+                $ep = $endpoints[$reqIdx % $endpoints.Count]
+                $reqIdx++
+                $activeTasks.Add($globalClient.GetAsync("$baseUrl$ep"))
+            }
+            continue
+        }
+
+        # Process the completed task
+        $task = $activeTasks[$completedIdx]
+        if ($task.Status -eq "RanToCompletion" -and $null -ne $task.Result) {
+            try { [void]$task.Result.Content.ReadAsByteArrayAsync().Result } catch {}
+            if ($task.Result.IsSuccessStatusCode) {
+                $phaseRequests++
+                $sampleRequests++
             } else {
                 $phaseErrors++
+                $errorHttpStatus++
             }
-            $task.Dispose()
+            $task.Result.Dispose()
+        } else {
+            $phaseErrors++
+            # Categorize the error
+            if ($task.Status -eq "Faulted" -and $null -ne $task.Exception) {
+                $innerMsg = $task.Exception.InnerException.Message
+                if ($innerMsg -match "timed? ?out|TaskCanceled") {
+                    $errorTimeouts++
+                } else {
+                    $errorConnRefused++
+                }
+            } else {
+                $errorTimeouts++
+            }
         }
+        $task.Dispose()
+
+        # Immediately replace with a new request (keeps pipeline full)
+        $ep = $endpoints[$reqIdx % $endpoints.Count]
+        $reqIdx++
+        $activeTasks[$completedIdx] = $globalClient.GetAsync("$baseUrl$ep")
 
         # Record throughput sample every ~1 second
         $now = $globalSw.Elapsed.TotalSeconds
@@ -267,7 +311,24 @@ foreach ($phase in $phases) {
         }
     }
 
-    # Flush the final sub-second throughput bucket for this phase
+    # Drain remaining active tasks
+    try { [void][System.Threading.Tasks.Task]::WaitAll($activeTasks.ToArray(), 3000) } catch {}
+    foreach ($task in $activeTasks) {
+        if ($task.IsCompleted -and $task.Status -eq "RanToCompletion" -and $null -ne $task.Result) {
+            try { [void]$task.Result.Content.ReadAsByteArrayAsync().Result } catch {}
+            if ($task.Result.IsSuccessStatusCode) {
+                $phaseRequests++
+                $sampleRequests++
+            } else {
+                $phaseErrors++
+                $errorHttpStatus++
+            }
+            $task.Result.Dispose()
+        }
+        if ($task.IsCompleted) { $task.Dispose() }
+    }
+
+    # Flush the final throughput bucket for this phase
     if ($sampleRequests -gt 0) {
         $now = $globalSw.Elapsed.TotalSeconds
         $dt = $now - $lastSampleTime
@@ -325,6 +386,11 @@ $peakRps       = ($throughputSamples | ForEach-Object { $_.rps })      | Measure
 Write-Host ""
 Write-Banner "Summary"
 Write-Stat "Total requests" "$totalRequests ($totalErrors errors)"
+if ($totalErrors -gt 0) {
+    Write-Stat "  Timeouts"    "$errorTimeouts"
+    Write-Stat "  Conn errors" "$errorConnRefused"
+    Write-Stat "  HTTP errors" "$errorHttpStatus"
+}
 Write-Stat "Wall time"      "$([math]::Round($totalWallSecs, 2)) s"
 Write-Stat "Avg throughput" "$avgRps req/s"
 Write-Stat "Peak throughput" "$([math]::Round($peakRps, 1)) req/s"
@@ -352,6 +418,9 @@ $summaryJson = @"
 {
     "totalRequests": $totalRequests,
     "totalErrors": $totalErrors,
+    "errorTimeouts": $errorTimeouts,
+    "errorConnRefused": $errorConnRefused,
+    "errorHttpStatus": $errorHttpStatus,
     "wallTimeSec": $([math]::Round($totalWallSecs, 2)),
     "avgRps": $avgRps,
     "peakRps": $([math]::Round($peakRps, 1)),

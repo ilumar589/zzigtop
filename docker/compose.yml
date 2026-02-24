@@ -1,4 +1,7 @@
 services:
+  # --------------------------------------------------------------------------
+  #  PostgreSQL database
+  # --------------------------------------------------------------------------
   postgres:
     image: postgres:16
     environment:
@@ -15,6 +18,104 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
+    networks:
+      - zignet
+
+  # --------------------------------------------------------------------------
+  #  Zig HTTP server (ReleaseFast on Alpine Linux)
+  # --------------------------------------------------------------------------
+  server:
+    build:
+      context: ..
+      dockerfile: docker/server.Dockerfile
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PORT: 8080
+    # Server with database connected, high backlog, io_uring-ready
+    # idle-timeout=0 and request-timeout=0 take the fast path (direct calls,
+    # no io.select/io.async racing) which avoids Zig std.Io fiber issues.
+    command:
+      - "--port"
+      - "8080"
+      - "--db-host"
+      - "postgres"
+      - "--db-port"
+      - "5432"
+      - "--backlog"
+      - "4096"
+      - "--idle-timeout"
+      - "0"
+      - "--request-timeout"
+      - "0"
+      - "--static-dir"
+      - "public"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
+      interval: 3s
+      timeout: 3s
+      start_period: 3s
+      retries: 5
+    # Zig's std.Io prefers io_uring on Linux for async I/O.  Docker's default
+    # seccomp profile blocks the io_uring_* syscalls, forcing a fallback to
+    # epoll.  Unconfined lets io_uring run for maximum throughput.
+    security_opt:
+      - seccomp:unconfined
+    networks:
+      - zignet
+    profiles:
+      - server
+      - bench
+      - bench-db
+
+  # --------------------------------------------------------------------------
+  #  Benchmark runner without database tests
+  # --------------------------------------------------------------------------
+  bench:
+    build:
+      context: ..
+      dockerfile: docker/bench.Dockerfile
+    depends_on:
+      server:
+        condition: service_healthy
+    environment:
+      SERVER_URL: "http://server:8080"
+      DURATION: "10"
+      PIPELINE: "16"
+      TEST_DB: "false"
+    networks:
+      - zignet
+    profiles:
+      - bench
+
+  # --------------------------------------------------------------------------
+  #  Benchmark runner with database tests
+  # --------------------------------------------------------------------------
+  bench-db:
+    build:
+      context: ..
+      dockerfile: docker/bench.Dockerfile
+    depends_on:
+      server:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      SERVER_URL: "http://server:8080"
+      DURATION: "10"
+      PIPELINE: "16"
+      TEST_DB: "true"
+    networks:
+      - zignet
+    profiles:
+      - bench-db
 
 volumes:
   pgdata:
+
+networks:
+  zignet:
+    driver: bridge

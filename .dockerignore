@@ -1,0 +1,20 @@
+# Ignore build artifacts, caches, and unnecessary files
+zig-out/
+zig-pkg/
+.zig-cache/
+*.exe
+*.pdb
+*.obj
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.vscode/
+
+# Reports
+benchmark-report.html
+
+# Node
+node_modules/

@@ -3,6 +3,33 @@
 This document details every performance optimization used in the HTTP/1 server,
 explaining what each technique does, why it matters, and how it's implemented in Zig.
 
+## Benchmark Results
+
+Measured with **wrk** (compiled from source) using HTTP pipelining (16-depth),
+running on Docker Desktop with 16 CPU cores. Server built with ReleaseFast on
+Alpine Linux.
+
+| Test | Connections | Requests/sec | Avg Latency |
+|------|-------------|-------------:|-------------|
+| **Plaintext pipelined** | 16 | **2,463,200** | 82 μs |
+| Plaintext pipelined | 128 | 950,993 | — |
+| Plaintext pipelined | 256 | 999,527 | — |
+| Plaintext no-pipeline | 16 | 413,046 | 95 μs |
+| Plaintext no-pipeline | 128 | 130,303 | — |
+| JSON /metrics | 16 | 13,543 | 22 ms |
+| Dynamic /hello/bench | 16 | 5,478 | 25 ms |
+| Query /search | 16 | 17,529 | 20 ms |
+| Latency (1 conn) | 1 | 21,852 | p50=42μs, p99=79μs |
+| Latency (10 conn) | 10 | 119,171 | p50=77μs, p99=106μs |
+
+**Context (TechEmpower Round 22, 28-core hardware):**
+- Kestrel (aspcore raw): 7,006,142 req/s
+- Go gnet: 7,013,961 req/s
+- Go net/http: 681,653 req/s
+- Node.js: 454,082 req/s
+
+To reproduce: `.\run-bench.ps1` (requires Docker Desktop).
+
 ---
 
 ## 1. Arena Allocator Per Request
@@ -635,8 +662,14 @@ for servers that only serve API routes.
 
 ### io_uring / IOCP
 These are platform-specific async I/O APIs. Zig 0.16's `std.Io` abstracts over
-them when available, but we use the threaded model for simplicity and
-cross-platform compatibility.
+them — on Linux, it uses io_uring when available (with epoll fallback). The Docker
+benchmark setup enables this via `seccomp:unconfined` since Docker's default
+seccomp profile blocks the io_uring_* syscalls.
+
+**Note:** The `io.select()` API (used to race a read against a timeout) has a bug
+where fibers get permanently stuck after the client disconnects. Setting
+`--idle-timeout 0 --request-timeout 0` takes a direct-call fast path that avoids
+`io.select` entirely, which is why the Docker benchmark uses these flags.
 
 ### Memory-Mapped Static Files
 Considered for future implementation. Would use `mmap` to serve static files
