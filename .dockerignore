@@ -15,6 +15,7 @@ zig-pkg/
 
 # Reports
 benchmark-report.html
+results/
 
 # Node
 node_modules/

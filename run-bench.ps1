@@ -117,6 +117,17 @@ Write-Host "Total wall time: $([math]::Round($elapsed.TotalSeconds, 1))s" -Foreg
 if ($dockerExit -ne 0) {
     Write-Host "Docker exited with code $dockerExit (bench container finished)" -ForegroundColor DarkGray
 }
+
+# Open HTML report if it was generated
+$reportPath = Join-Path $PSScriptRoot (Join-Path "results" "docker-bench-report.html")
+if (Test-Path $reportPath) {
+    Write-Host ""
+    Write-Host "Report: $reportPath" -ForegroundColor Cyan
+    Start-Process $reportPath
+} else {
+    Write-Host "Report not found at $reportPath" -ForegroundColor DarkGray
+}
+
 Write-Host ""
 Write-Host "To view server logs:  docker compose -f docker/compose.yml --profile server logs server"
 Write-Host "To tear down:         .\run-bench.ps1 -Down"

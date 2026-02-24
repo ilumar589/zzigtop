@@ -86,6 +86,9 @@ services:
       DURATION: "10"
       PIPELINE: "16"
       TEST_DB: "false"
+      REPORT_DIR: "/results"
+    volumes:
+      - "../results:/results"
     networks:
       - zignet
     profiles:
@@ -108,6 +111,9 @@ services:
       DURATION: "10"
       PIPELINE: "16"
       TEST_DB: "true"
+      REPORT_DIR: "/results"
+    volumes:
+      - "../results:/results"
     networks:
       - zignet
     profiles:
