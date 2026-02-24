@@ -66,12 +66,10 @@ fn wrapInLayout(request: *Request, arena: std.mem.Allocator, title: []const u8, 
     });
 }
 
-/// Get a repository instance, or return null (sends 503 on failure).
-fn getRepo(response: *Response) ?Repository {
-    const database = global_db orelse {
-        response.sendText(.service_unavailable, "Database not connected. Start PostgreSQL and restart server.") catch {};
-        return null;
-    };
+/// Get a repository instance, or return null if no database is connected.
+/// Callers are responsible for sending an appropriate fallback response.
+fn getRepo(_: *Response) ?Repository {
+    const database = global_db orelse return null;
     return Repository.init(database);
 }
 

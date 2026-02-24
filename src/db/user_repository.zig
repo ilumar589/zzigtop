@@ -24,7 +24,7 @@ const Database = @import("database.zig");
 
 /// A user record from the `users` table.
 ///
-/// Field order matches the SELECT column order (ordinal mapping).
+/// Fields are matched by column name (named mapping via pg.zig).
 pub const User = struct {
     id: i32,
     name: []const u8,
@@ -77,7 +77,7 @@ pub fn getById(self: *UserRepository, id: i32, arena: std.mem.Allocator) !?User 
     )) |qr_val| {
         var qr = qr_val;
         defer qr.deinit() catch {};
-        return qr.to(User, .{ .allocator = arena }) catch return null;
+        return qr.to(User, .{ .map = .name, .allocator = arena }) catch return null;
     }
     return null;
 }
@@ -95,7 +95,7 @@ pub fn create(self: *UserRepository, input: CreateUserInput, arena: std.mem.Allo
     )) |qr_val| {
         var qr = qr_val;
         defer qr.deinit() catch {};
-        return qr.to(User, .{ .allocator = arena }) catch return null;
+        return qr.to(User, .{ .map = .name, .allocator = arena }) catch return null;
     }
     return null;
 }
@@ -113,7 +113,7 @@ pub fn update(self: *UserRepository, id: i32, input: CreateUserInput, arena: std
     )) |qr_val| {
         var qr = qr_val;
         defer qr.deinit() catch {};
-        return qr.to(User, .{ .allocator = arena }) catch return null;
+        return qr.to(User, .{ .map = .name, .allocator = arena }) catch return null;
     }
     return null;
 }

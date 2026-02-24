@@ -33,11 +33,11 @@ pub fn createJob(self: *Repository, total_sites: i32, arena: std.mem.Allocator) 
     if (try self.db.row(
         \\INSERT INTO scrape_jobs (status, total_sites, started_at)
         \\VALUES ('running', $1, NOW())
-        \\RETURNING id, status, total_sites, completed_sites, errors_count
+        \\RETURNING id, status, total_sites, completed_sites, errors_count, started_at::text
     , .{total_sites})) |qr_val| {
         var qr = qr_val;
         defer qr.deinit() catch {};
-        return qr.to(Types.ScrapeJob, .{ .allocator = arena }) catch return null;
+        return qr.to(Types.ScrapeJob, .{ .map = .name, .allocator = arena }) catch return null;
     }
     return null;
 }
@@ -63,12 +63,13 @@ pub fn completeJob(self: *Repository, job_id: i32, status: []const u8, summary: 
 /// Get a job by ID.
 pub fn getJob(self: *Repository, job_id: i32, arena: std.mem.Allocator) !?Types.ScrapeJob {
     if (try self.db.row(
-        \\SELECT id, status, total_sites, completed_sites, errors_count, results_summary
+        \\SELECT id, status, total_sites, completed_sites, errors_count, results_summary,
+        \\  started_at::text, completed_at::text
         \\FROM scrape_jobs WHERE id = $1
     , .{job_id})) |qr_val| {
         var qr = qr_val;
         defer qr.deinit() catch {};
-        return qr.to(Types.ScrapeJob, .{ .allocator = arena }) catch return null;
+        return qr.to(Types.ScrapeJob, .{ .map = .name, .allocator = arena }) catch return null;
     }
     return null;
 }
@@ -76,7 +77,9 @@ pub fn getJob(self: *Repository, job_id: i32, arena: std.mem.Allocator) !?Types.
 /// Get recent jobs (most recent first, limited).
 pub fn getRecentJobs(self: *Repository, limit: i32, arena: std.mem.Allocator) ![]Types.JobReport {
     var result = try self.db.query(
-        \\SELECT id as job_id, status, total_sites, completed_sites, errors_count
+        \\SELECT id as job_id, status, total_sites, completed_sites, errors_count,
+        \\  started_at::text, completed_at::text,
+        \\  EXTRACT(EPOCH FROM (completed_at - started_at))::int as duration_seconds
         \\FROM scrape_jobs
         \\ORDER BY id DESC
         \\LIMIT $1
@@ -85,7 +88,7 @@ pub fn getRecentJobs(self: *Repository, limit: i32, arena: std.mem.Allocator) ![
 
     var jobs = std.ArrayList(Types.JobReport){};
     while (try result.next()) |row| {
-        try jobs.append(arena, try row.to(Types.JobReport, .{ .allocator = arena }));
+        try jobs.append(arena, try row.to(Types.JobReport, .{ .map = .name, .allocator = arena }));
     }
     return jobs.toOwnedSlice(arena);
 }
@@ -105,7 +108,7 @@ pub fn storeRawScrapeData(self: *Repository, input: Types.CreateRawScrapeInput) 
 /// Get raw scrape data for a job.
 pub fn getRawDataByJob(self: *Repository, job_id: i32, arena: std.mem.Allocator) ![]Types.RawScrapeData {
     var result = try self.db.query(
-        \\SELECT id, job_id, site_id, url, extracted_json, status, error_message
+        \\SELECT id, job_id, site_id, url, extracted_json, scraped_at::text, status, error_message
         \\FROM raw_scrape_data
         \\WHERE job_id = $1
         \\ORDER BY id
@@ -114,7 +117,7 @@ pub fn getRawDataByJob(self: *Repository, job_id: i32, arena: std.mem.Allocator)
 
     var data = std.ArrayList(Types.RawScrapeData){};
     while (try result.next()) |row| {
-        try data.append(arena, try row.to(Types.RawScrapeData, .{ .allocator = arena }));
+        try data.append(arena, try row.to(Types.RawScrapeData, .{ .map = .name, .allocator = arena }));
     }
     return data.toOwnedSlice(arena);
 }
@@ -131,7 +134,7 @@ pub fn getJobErrors(self: *Repository, job_id: i32, arena: std.mem.Allocator) ![
 
     var errors = std.ArrayList(Types.SiteError){};
     while (try result.next()) |row| {
-        try errors.append(arena, try row.to(Types.SiteError, .{ .allocator = arena }));
+        try errors.append(arena, try row.to(Types.SiteError, .{ .map = .name, .allocator = arena }));
     }
     return errors.toOwnedSlice(arena);
 }
@@ -152,7 +155,7 @@ pub fn upsertCompetition(self: *Repository, input: Types.CreateCompetitionInput,
     , .{ input.name, input.country, input.season, input.site_source })) |qr_val| {
         var qr = qr_val;
         defer qr.deinit() catch {};
-        return qr.to(Types.Competition, .{ .allocator = arena }) catch return null;
+        return qr.to(Types.Competition, .{ .map = .name, .allocator = arena }) catch return null;
     }
     return null;
 }
@@ -167,7 +170,7 @@ pub fn getAllCompetitions(self: *Repository, arena: std.mem.Allocator) ![]Types.
 
     var comps = std.ArrayList(Types.Competition){};
     while (try result.next()) |row| {
-        try comps.append(arena, try row.to(Types.Competition, .{ .allocator = arena }));
+        try comps.append(arena, try row.to(Types.Competition, .{ .map = .name, .allocator = arena }));
     }
     return comps.toOwnedSlice(arena);
 }
@@ -190,7 +193,7 @@ pub fn upsertTeam(self: *Repository, input: Types.CreateTeamInput, arena: std.me
     , .{ input.name, input.short_name, input.country, input.competition_id, input.logo_url })) |qr_val| {
         var qr = qr_val;
         defer qr.deinit() catch {};
-        return qr.to(Types.Team, .{ .allocator = arena }) catch return null;
+        return qr.to(Types.Team, .{ .map = .name, .allocator = arena }) catch return null;
     }
     return null;
 }
@@ -205,7 +208,7 @@ pub fn getAllTeams(self: *Repository, arena: std.mem.Allocator) ![]Types.Team {
 
     var teams = std.ArrayList(Types.Team){};
     while (try result.next()) |row| {
-        try teams.append(arena, try row.to(Types.Team, .{ .allocator = arena }));
+        try teams.append(arena, try row.to(Types.Team, .{ .map = .name, .allocator = arena }));
     }
     return teams.toOwnedSlice(arena);
 }
@@ -219,11 +222,11 @@ pub fn insertMatch(self: *Repository, input: Types.CreateMatchInput, arena: std.
     if (try self.db.row(
         \\INSERT INTO matches (competition_id, home_team_id, away_team_id, match_date, status, home_score, away_score, venue, matchday)
         \\VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-        \\RETURNING id, competition_id, home_team_id, away_team_id, status, home_score, away_score, venue, matchday
+        \\RETURNING id, competition_id, home_team_id, away_team_id, match_date::text, status, home_score, away_score, venue, matchday
     , .{ input.competition_id, input.home_team_id, input.away_team_id, input.match_date, input.status, input.home_score, input.away_score, input.venue, input.matchday })) |qr_val| {
         var qr = qr_val;
         defer qr.deinit() catch {};
-        return qr.to(Types.Match, .{ .allocator = arena }) catch return null;
+        return qr.to(Types.Match, .{ .map = .name, .allocator = arena }) catch return null;
     }
     return null;
 }
@@ -231,14 +234,14 @@ pub fn insertMatch(self: *Repository, input: Types.CreateMatchInput, arena: std.
 /// Get recent matches.
 pub fn getRecentMatches(self: *Repository, limit: i32, arena: std.mem.Allocator) ![]Types.Match {
     var result = try self.db.query(
-        \\SELECT id, competition_id, home_team_id, away_team_id, status, home_score, away_score, venue, matchday
+        \\SELECT id, competition_id, home_team_id, away_team_id, match_date::text, status, home_score, away_score, venue, matchday
         \\FROM matches ORDER BY id DESC LIMIT $1
     , .{limit});
     defer result.deinit();
 
     var matches = std.ArrayList(Types.Match){};
     while (try result.next()) |row| {
-        try matches.append(arena, try row.to(Types.Match, .{ .allocator = arena }));
+        try matches.append(arena, try row.to(Types.Match, .{ .map = .name, .allocator = arena }));
     }
     return matches.toOwnedSlice(arena);
 }
@@ -260,7 +263,7 @@ pub fn upsertPlayer(self: *Repository, input: Types.CreatePlayerInput, arena: st
     , .{ input.name, input.team_id, input.position, input.number, input.nationality })) |qr_val| {
         var qr = qr_val;
         defer qr.deinit() catch {};
-        return qr.to(Types.Player, .{ .allocator = arena }) catch return null;
+        return qr.to(Types.Player, .{ .map = .name, .allocator = arena }) catch return null;
     }
     return null;
 }
@@ -275,7 +278,7 @@ pub fn getAllPlayers(self: *Repository, arena: std.mem.Allocator) ![]Types.Playe
 
     var players = std.ArrayList(Types.Player){};
     while (try result.next()) |row| {
-        try players.append(arena, try row.to(Types.Player, .{ .allocator = arena }));
+        try players.append(arena, try row.to(Types.Player, .{ .map = .name, .allocator = arena }));
     }
     return players.toOwnedSlice(arena);
 }
@@ -295,14 +298,14 @@ pub fn insertInjury(self: *Repository, player_id: ?i32, team_id: ?i32, injury_ty
 /// Get all current injuries.
 pub fn getAllInjuries(self: *Repository, arena: std.mem.Allocator) ![]Types.Injury {
     var result = try self.db.query(
-        "SELECT id, player_id, team_id, injury_type, expected_return, site_source FROM injuries ORDER BY id DESC",
+        "SELECT id, player_id, team_id, injury_type, expected_return, reported_at::text, site_source FROM injuries ORDER BY id DESC",
         .{},
     );
     defer result.deinit();
 
     var injuries = std.ArrayList(Types.Injury){};
     while (try result.next()) |row| {
-        try injuries.append(arena, try row.to(Types.Injury, .{ .allocator = arena }));
+        try injuries.append(arena, try row.to(Types.Injury, .{ .map = .name, .allocator = arena }));
     }
     return injuries.toOwnedSlice(arena);
 }
@@ -321,7 +324,7 @@ pub fn getStandings(self: *Repository, competition_id: i32, arena: std.mem.Alloc
 
     var standings = std.ArrayList(Types.Standing){};
     while (try result.next()) |row| {
-        try standings.append(arena, try row.to(Types.Standing, .{ .allocator = arena }));
+        try standings.append(arena, try row.to(Types.Standing, .{ .map = .name, .allocator = arena }));
     }
     return standings.toOwnedSlice(arena);
 }
@@ -339,7 +342,7 @@ pub fn getDashboardStats(self: *Repository, arena: std.mem.Allocator) !Types.Das
         var qr = qr_val;
         defer qr.deinit() catch {};
         const CountResult = struct { cnt: i32 };
-        if (qr.to(CountResult, .{ .allocator = arena })) |r| {
+        if (qr.to(CountResult, .{ .map = .name, .allocator = arena })) |r| {
             stats.total_competitions = r.cnt;
         } else |_| {}
     }
@@ -349,7 +352,7 @@ pub fn getDashboardStats(self: *Repository, arena: std.mem.Allocator) !Types.Das
         var qr = qr_val;
         defer qr.deinit() catch {};
         const CountResult = struct { cnt: i32 };
-        if (qr.to(CountResult, .{ .allocator = arena })) |r| {
+        if (qr.to(CountResult, .{ .map = .name, .allocator = arena })) |r| {
             stats.total_teams = r.cnt;
         } else |_| {}
     }
@@ -359,7 +362,7 @@ pub fn getDashboardStats(self: *Repository, arena: std.mem.Allocator) !Types.Das
         var qr = qr_val;
         defer qr.deinit() catch {};
         const CountResult = struct { cnt: i32 };
-        if (qr.to(CountResult, .{ .allocator = arena })) |r| {
+        if (qr.to(CountResult, .{ .map = .name, .allocator = arena })) |r| {
             stats.total_matches = r.cnt;
         } else |_| {}
     }
@@ -369,7 +372,7 @@ pub fn getDashboardStats(self: *Repository, arena: std.mem.Allocator) !Types.Das
         var qr = qr_val;
         defer qr.deinit() catch {};
         const CountResult = struct { cnt: i32 };
-        if (qr.to(CountResult, .{ .allocator = arena })) |r| {
+        if (qr.to(CountResult, .{ .map = .name, .allocator = arena })) |r| {
             stats.total_jobs = r.cnt;
         } else |_| {}
     }

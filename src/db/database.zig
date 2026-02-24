@@ -22,6 +22,8 @@ pub const Result = pg.Result;
 pub const Row = pg.Row;
 /// A row from a single-column query.
 pub const QueryRow = pg.QueryRow;
+/// Connection-level query options (timeout, column_names, etc.).
+pub const QueryOpts = pg.Conn.QueryOpts;
 
 const Io = std.Io;
 
@@ -94,7 +96,7 @@ pub fn deinit(self: *Database) void {
 /// }
 /// ```
 pub fn query(self: *Database, sql: []const u8, values: anytype) !*Result {
-    return self.pool.query(sql, values);
+    return self.pool.queryOpts(sql, values, .{ .column_names = true });
 }
 
 /// Execute a command (INSERT/UPDATE/DELETE) that returns affected row count.
@@ -123,7 +125,7 @@ pub fn exec(self: *Database, sql: []const u8, values: anytype) !?i64 {
 /// }
 /// ```
 pub fn row(self: *Database, sql: []const u8, values: anytype) !?QueryRow {
-    return self.pool.row(sql, values);
+    return self.pool.rowOpts(sql, values, .{ .column_names = true });
 }
 
 /// Acquire a raw connection from the pool for multi-statement transactions.
