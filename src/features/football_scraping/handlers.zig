@@ -438,6 +438,47 @@ pub fn handleRecentJobs(request: *Request, response: *Response, _: Io) anyerror!
     }
 }
 
+/// GET /scraper/reports/job/:id — Job detail fragment (errors + raw data).
+pub fn handleJobDetail(request: *Request, response: *Response, _: Io) anyerror!void {
+    const arena = request.arena;
+
+    const id_str = request.pathParam("id") orelse {
+        try response.sendText(.bad_request, "Missing job ID");
+        return;
+    };
+    const job_id = std.fmt.parseInt(i32, id_str, 10) catch {
+        try response.sendText(.bad_request, "Invalid job ID");
+        return;
+    };
+
+    if (getRepo(response)) |repo_val| {
+        var repo = repo_val;
+
+        // Get the job itself
+        const job = repo.getJob(job_id, arena) catch null;
+        const job_status = if (job) |j| j.status else "unknown";
+        const job_total = if (job) |j| j.total_sites else 0;
+        const job_completed = if (job) |j| j.completed_sites else 0;
+        const job_errors = if (job) |j| j.errors_count else 0;
+
+        // Get errors for this job
+        const errs = repo.getJobErrors(job_id, arena) catch &.{};
+
+        const body = try Templates.job_detail_fragment.render(arena, .{
+            .job_id = try intToStr(arena, job_id),
+            .status = job_status,
+            .total_sites = try intToStr(arena, job_total),
+            .completed_sites = try intToStr(arena, job_completed),
+            .errors_count = try intToStr(arena, job_errors),
+            .has_errors = errs.len > 0,
+            .errors = errs,
+        });
+        try response.sendHtml(.ok, body);
+    } else {
+        try response.sendHtml(.ok, "<p class=\"empty-state\">Database not available.</p>");
+    }
+}
+
 // ============================================================================
 // JSON API Handlers
 // ============================================================================

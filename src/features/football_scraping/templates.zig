@@ -326,6 +326,35 @@ pub const recent_jobs_fragment = Template.compile(
 );
 
 // ============================================================================
+// Job Detail Fragment
+// ============================================================================
+
+/// Job detail panel — shown when clicking "Details" on a job row.
+pub const job_detail_fragment = Template.compile(
+    \\<div class="job-detail-panel">
+    \\  <h3>Job #{{job_id}} Details</h3>
+    \\  <div class="detail-grid">
+    \\    <div class="detail-item"><strong>Status:</strong> <span class="badge badge-{{status}}">{{status}}</span></div>
+    \\    <div class="detail-item"><strong>Sites:</strong> {{total_sites}}</div>
+    \\    <div class="detail-item"><strong>Completed:</strong> {{completed_sites}}</div>
+    \\    <div class="detail-item"><strong>Errors:</strong> {{errors_count}}</div>
+    \\  </div>
+    \\  {{#if has_errors}}<h4>Errors</h4>
+    \\  <table class="data-table compact">
+    \\    <thead><tr><th>Site</th><th>URL</th><th>Error</th></tr></thead>
+    \\    <tbody>
+    \\      {{#each errors}}<tr>
+    \\        <td>{{site_name}}</td>
+    \\        <td>{{url}}</td>
+    \\        <td>{{error_message}}</td>
+    \\      </tr>{{/each}}
+    \\    </tbody>
+    \\  </table>{{/if}}
+    \\  {{#if has_errors}}{{else}}<p class="empty-state">No errors for this job.</p>{{/if}}
+    \\</div>
+);
+
+// ============================================================================
 // Raw JSON Viewer
 // ============================================================================
 

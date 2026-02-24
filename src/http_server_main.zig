@@ -74,6 +74,7 @@ const router = http.Router.init(.{
     .{ .GET, "/scraper/reports", withMiddleware(scraper_handlers.handleReports) },
     .{ .GET, "/scraper/reports-content", withMiddleware(scraper_handlers.handleReportsContent) },
     .{ .GET, "/scraper/reports/jobs", withMiddleware(scraper_handlers.handleReportsJobs) },
+    .{ .GET, "/scraper/reports/job/:id", withMiddleware(scraper_handlers.handleJobDetail) },
     .{ .GET, "/scraper/recent-jobs", withMiddleware(scraper_handlers.handleRecentJobs) },
     .{ .GET, "/scraper/api/sites", withApiMiddleware(scraper_handlers.handleApiSites) },
     .{ .GET, "/scraper/api/jobs", withApiMiddleware(scraper_handlers.handleApiJobs) },
