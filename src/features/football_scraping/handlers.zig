@@ -167,40 +167,91 @@ pub fn handleProgress(request: *Request, response: *Response, _: Io) anyerror!vo
 // ============================================================================
 
 /// POST /scraper/start — Start a new scrape job.
-pub fn handleStartScrape(request: *Request, response: *Response, _: Io) anyerror!void {
+pub fn handleStartScrape(request: *Request, response: *Response, io: Io) anyerror!void {
     const arena = request.arena;
+
+    std.debug.print("[handler] POST /scraper/start — beginning scrape job\n", .{});
 
     // Check if a job is already running
     const snap = Scraper.progress.snapshot();
     if (snap.isRunning()) {
+        std.debug.print("[handler] Job already running (id={d}), returning current progress\n", .{snap.job_id});
         const body = try buildProgressHtml(arena, &snap);
         try response.sendHtml(.ok, body);
         return;
     }
 
-    // Run the scrape (synchronous for now — runs in the handler's fiber)
-    const results = try Scraper.runScrapeJob(arena, &site_state);
+    // Create DB job BEFORE scraping starts
+    var db_job_id: ?i32 = null;
+    if (global_db) |database| {
+        var repo = Repository.init(database);
+        // Count enabled sites
+        var enabled: i32 = 0;
+        for (site_state.enabled_flags) |f| {
+            if (f) enabled += 1;
+        }
+        if (repo.createJob(enabled, arena)) |maybe_job| {
+            if (maybe_job) |job| {
+                db_job_id = job.id;
+                std.debug.print("[handler] Created DB job id={d}\n", .{job.id});
+            }
+        } else |err| {
+            std.debug.print("[handler] WARNING: failed to create DB job: {}\n", .{err});
+        }
+    }
+
+    // Run the scrape (synchronous — runs in the handler's fiber)
+    std.debug.print("[handler] Starting scrape across enabled sites...\n", .{});
+    const results = Scraper.runScrapeJob(arena, io, &site_state) catch |err| {
+        std.debug.print("[handler] runScrapeJob FAILED: {}\n", .{err});
+        // Mark DB job as failed
+        if (db_job_id) |jid| {
+            if (global_db) |database| {
+                var repo = Repository.init(database);
+                repo.completeJob(jid, "failed", null) catch {};
+            }
+        }
+        const body = try buildProgressHtml(arena, &Scraper.progress.snapshot());
+        try response.sendHtml(.ok, body);
+        return;
+    };
+
+    std.debug.print("[handler] Scrape complete: {d} site results\n", .{results.len});
 
     // Store results in DB if available
     if (global_db) |database| {
         var repo = Repository.init(database);
-        const job = repo.createJob(@intCast(results.len), arena) catch null;
-        if (job) |j| {
+        // Use pre-created job ID, or create one now as fallback
+        var jid = db_job_id;
+        if (jid == null) {
+            if (repo.createJob(@intCast(results.len), arena)) |maybe_job| {
+                if (maybe_job) |job| jid = job.id;
+            } else |err| {
+                std.debug.print("[handler] WARNING: fallback createJob failed: {}\n", .{err});
+            }
+        }
+        if (jid) |job_id| {
             for (results) |result| {
+                std.debug.print("[handler] Storing result: site={s} success={} items={d}\n", .{
+                    result.site_id, result.success, result.items_found,
+                });
                 repo.storeRawScrapeData(.{
-                    .job_id = j.id,
+                    .job_id = job_id,
                     .site_id = result.site_id,
                     .url = result.url,
                     .extracted_json = result.extracted_json,
                     .status = if (result.success) "success" else "error",
                     .error_message = result.error_message,
-                }) catch {};
+                }) catch |err| {
+                    std.debug.print("[handler] WARNING: store raw data failed: {}\n", .{err});
+                };
             }
-            repo.completeJob(
-                j.id,
-                if (Scraper.progress.snapshot().isFailed()) "failed" else "completed",
-                null,
-            ) catch {};
+
+            const final_status = if (Scraper.progress.snapshot().isFailed()) "failed" else "completed";
+            std.debug.print("[handler] Completing job {d} with status={s}\n", .{ job_id, final_status });
+            repo.completeJob(job_id, final_status, null) catch |err| {
+                std.debug.print("[handler] WARNING: completeJob failed: {}\n", .{err});
+            };
         }
     }
 

@@ -63,7 +63,34 @@ pub const DataType = enum {
 
 /// Default set of football data source sites.
 /// These are compiled into the binary and used to seed the database.
+///
+/// Sites are selected for server-rendered HTML (scraping-friendly).
+/// JS-heavy SPAs (Flashscore, SofaScore) are included but may yield
+/// less data since we don't execute JavaScript.
 pub const default_sites = [_]Site{
+    .{
+        .id = "worldfootball",
+        .name = "WorldFootball.net",
+        .base_url = "https://www.worldfootball.net",
+        .category = "standings,results,history",
+        .description = "Historical data, standings, and comprehensive results — pure HTML tables, very scraping-friendly",
+        .endpoints = &.{
+            .{ .data_type = .standings, .path = "/competition/eng-premier-league/", .description = "Premier League table" },
+            .{ .data_type = .scores, .path = "/all_matches/eng-premier-league-2024-2025/", .description = "All PL 2024-25 results" },
+            .{ .data_type = .standings, .path = "/competition/esp-primera-division/", .description = "La Liga table" },
+        },
+    },
+    .{
+        .id = "fbref",
+        .name = "FBRef",
+        .base_url = "https://fbref.com",
+        .category = "stats,players,teams",
+        .description = "Advanced statistics, player data, and team analysis — HTML data tables",
+        .endpoints = &.{
+            .{ .data_type = .stats, .path = "/en/comps/9/Premier-League-Stats", .description = "Premier League stats" },
+            .{ .data_type = .players, .path = "/en/comps/9/stats/Premier-League-Stats", .description = "Player statistics" },
+        },
+    },
     .{
         .id = "espn_fc",
         .name = "ESPN FC",
@@ -72,8 +99,8 @@ pub const default_sites = [_]Site{
         .description = "Major leagues scores, standings, and transfer news",
         .endpoints = &.{
             .{ .data_type = .scores, .path = "/scoreboard", .description = "Today's scores" },
-            .{ .data_type = .standings, .path = "/standings", .description = "League standings" },
-            .{ .data_type = .fixtures, .path = "/schedule", .description = "Upcoming fixtures" },
+            .{ .data_type = .standings, .path = "/standings/_/league/eng.1", .description = "Premier League standings" },
+            .{ .data_type = .fixtures, .path = "/schedule/_/league/eng.1", .description = "PL fixtures" },
         },
     },
     .{
@@ -101,46 +128,24 @@ pub const default_sites = [_]Site{
         },
     },
     .{
+        .id = "soccerway",
+        .name = "Soccerway",
+        .base_url = "https://int.soccerway.com",
+        .category = "matches,standings,teams",
+        .description = "Comprehensive match data and statistics — server-rendered",
+        .endpoints = &.{
+            .{ .data_type = .scores, .path = "/matches/", .description = "Today's matches" },
+            .{ .data_type = .standings, .path = "/national/england/premier-league/20242025/regular-season/r80962/", .description = "PL standings" },
+        },
+    },
+    .{
         .id = "flashscore",
         .name = "Flashscore",
         .base_url = "https://www.flashscore.com/football",
         .category = "scores,live",
-        .description = "Live scores and real-time match results",
+        .description = "Live scores and real-time match results (JS-heavy, limited HTML extraction)",
         .endpoints = &.{
             .{ .data_type = .scores, .path = "/", .description = "Live and recent scores" },
-        },
-    },
-    .{
-        .id = "soccerway",
-        .name = "Soccerway",
-        .base_url = "https://www.soccerway.com",
-        .category = "matches,standings,teams",
-        .description = "Comprehensive match data and statistics",
-        .endpoints = &.{
-            .{ .data_type = .scores, .path = "/matches/today/", .description = "Today's matches" },
-            .{ .data_type = .standings, .path = "/national/england/premier-league/", .description = "League standings" },
-        },
-    },
-    .{
-        .id = "worldfootball",
-        .name = "WorldFootball.net",
-        .base_url = "https://www.worldfootball.net",
-        .category = "standings,results,history",
-        .description = "Historical data, standings, and comprehensive results",
-        .endpoints = &.{
-            .{ .data_type = .standings, .path = "/competition/eng-premier-league/", .description = "Premier League" },
-            .{ .data_type = .scores, .path = "/schedule/eng-premier-league/", .description = "Schedule and results" },
-        },
-    },
-    .{
-        .id = "fbref",
-        .name = "FBRef",
-        .base_url = "https://fbref.com",
-        .category = "stats,players,teams",
-        .description = "Advanced statistics, player data, and team analysis",
-        .endpoints = &.{
-            .{ .data_type = .stats, .path = "/en/comps/9/Premier-League-Stats", .description = "Premier League stats" },
-            .{ .data_type = .players, .path = "/en/comps/9/stats/Premier-League-Stats", .description = "Player statistics" },
         },
     },
     .{
@@ -148,7 +153,7 @@ pub const default_sites = [_]Site{
         .name = "SofaScore",
         .base_url = "https://www.sofascore.com/football",
         .category = "scores,ratings,live",
-        .description = "Live scores, player ratings, and match statistics",
+        .description = "Live scores, player ratings, and match statistics (JS SPA, limited extraction)",
         .endpoints = &.{
             .{ .data_type = .scores, .path = "/livescore", .description = "Live scores" },
             .{ .data_type = .standings, .path = "/tournament/premier-league/17", .description = "Standings" },

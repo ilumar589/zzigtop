@@ -4,7 +4,7 @@
 
 > **Last Updated:** 2026-02-24  
 > **Zig Version:** 0.16.0-dev.2535+b5bd49460  
-> **Status:** STEP 19 COMPLETE — Comptime middleware pipeline
+> **Status:** STEP 20 COMPLETE — Real HTTP scraping with std.http.Client
 
 ---
 
@@ -96,6 +96,16 @@
 | | 19-6: Request timing middleware (X-Request-Start header) | ✅ COMPLETE |
 | | 19-7: Wire into `http.zig` exports + apply to all routes in `http_server_main.zig` | ✅ COMPLETE |
 | | 19-8: Unit tests (16 tests, 182/182 total) + documentation | ✅ COMPLETE |
+| 20 | Real HTTP scraping with std.http.Client | ✅ COMPLETE |
+| | 20-1: `scraper.zig` — `fetchUrl()` rewritten with `std.http.Client` (TLS, redirects, 2MB limit) | ✅ COMPLETE |
+| | 20-2: `scraper.zig` — `Io` threaded through `runScrapeJob → scrapeSite → fetchUrl` | ✅ COMPLETE |
+| | 20-3: `scraper.zig` — per-site extraction patterns (`patternsForSite`) | ✅ COMPLETE |
+| | 20-4: `handlers.zig` — DB job created BEFORE scraping, Io passed to scraper | ✅ COMPLETE |
+| | 20-5: `handlers.zig` — comprehensive debug logging throughout job lifecycle | ✅ COMPLETE |
+| | 20-6: `sites.zig` — reordered for scraping-friendliness, updated endpoints for 2024-25 season | ✅ COMPLETE |
+| | 20-7: Named column mapping (`pg.zig` `.map = .name`) across all repositories | ✅ COMPLETE |
+| | 20-8: Job detail route (`/scraper/reports/job/:id`) + template | ✅ COMPLETE |
+| | 20-9: Tests (182/182 pass) + documentation | ✅ COMPLETE |
 
 ---
 
@@ -2104,6 +2114,158 @@ const cors = Middleware.Cors.init(.{
 | `src/http_server_main.zig` | Applied `withMiddleware` / `withApiMiddleware` to all 45+ routes; added CORS preflight routes |
 | `docs/PROGRESS.md` | This section |
 | `docs/API.md` | Middleware documentation |
+
+---
+
+## Step 20: Real HTTP Scraping with std.http.Client (COMPLETE)
+
+**What was done:**
+
+Replaced the simulated/placeholder scraper with a **real HTTP fetching engine** powered by Zig 0.16's `std.http.Client`. The scraper now makes actual HTTPS requests to real football data websites, extracts data from server-rendered HTML, and stores results in the database.
+
+### Key Changes
+
+#### Real HTTP Fetching (`scraper.zig`)
+
+```zig
+/// fetchUrl — real HTTP GET via std.http.Client
+pub fn fetchUrl(allocator: Allocator, io: Io, url: []const u8) ![]const u8 {
+    var client = std.http.Client{ .allocator = allocator, .io = io };
+    defer client.deinit();
+
+    var req = client.request(.GET, uri, .{
+        .headers = .{ .user_agent = .{ .override = USER_AGENT }, .accept_encoding = .{ .override = "identity" } },
+        .redirect_behavior = @enumFromInt(@as(u16, 3)),
+    });
+    // ... sendBodiless → receiveHead → reader.allocRemaining
+}
+```
+
+- **TLS**: Zig's built-in TLS with system certificate bundle (auto-loaded on first HTTPS request)
+- **Redirects**: Follows up to 3 HTTP redirects automatically
+- **Body limit**: 2 MB max via `Io.Limit.limited(MAX_BODY_SIZE)`
+- **User-Agent**: Browser-like string to avoid bot detection
+- **Accept-Encoding**: Force identity (no gzip) for simpler HTML parsing
+
+#### Io Threading
+
+The `Io` handle (Zig's async runtime) is now threaded through the entire call chain:
+
+```
+handleStartScrape(request, response, io)
+  → Scraper.runScrapeJob(arena, io, &site_state)
+    → scrapeSite(arena, io, site)
+      → fetchUrl(arena, io, url)
+        → std.http.Client{ .io = io }
+```
+
+#### Per-Site Extraction Patterns
+
+```zig
+fn patternsForSite(site_id: []const u8) []const SitePattern {
+    // worldfootball.net: <td class="hell">, <td class="dunkel">
+    // fbref.com: <td data-stat="...">, <th data-stat="...">
+    // espn: <span class="Table__Team">, <td class="Table__TD">
+    // bbc: team name spans, score number spans
+    // generic fallback: <td>, <th>, <h2>, <h3>
+}
+```
+
+#### Handler Job Lifecycle (Fixed)
+
+```
+1. Create DB job BEFORE scraping (with enabled site count)
+2. Run scraper with Io → real HTTP requests
+3. Store each site result in scrape_raw_data
+4. Complete job with final status
+```
+
+Previously, the DB job was only created after scraping finished, and `Io` was discarded.
+
+#### Comprehensive Logging
+
+Every step emits `[scraper]` or `[handler]` prefixed logs to stderr:
+
+```
+[handler] POST /scraper/start — beginning scrape job
+[handler] Created DB job id=1
+[scraper] === Starting scrape job ===
+[scraper] Enabled sites: 8/8
+[scraper] --- Site 1/8: WorldFootball.net ---
+[scraper] Scraping site: WorldFootball.net (worldfootball)
+[scraper]   GET https://www.worldfootball.net/competition/eng-premier-league/
+[scraper]   STATUS: 200 ok
+[scraper]   OK: 84521 bytes
+[scraper]   Found 2 JSON-LD blocks
+[scraper]   Pattern [table-cell]: 142 matches
+[scraper]   Total items extracted: 144 from WorldFootball.net
+[handler] Storing result: site=worldfootball success=true items=144
+[handler] Completing job 1 with status=completed
+```
+
+#### Named Column Mapping (pg.zig)
+
+All repository queries now use named column mapping instead of ordinal:
+
+```zig
+// Before (fragile — column order must match struct field order):
+row.to(ScrapeJob, .{})
+
+// After (robust — matches by column name):
+row.to(ScrapeJob, .{ .map = .name, .allocator = arena })
+
+// Database wrapper also passes column_names = true:
+self.pool.queryOpts(sql, values, .{ .column_names = true })
+```
+
+#### Sites Registry Updates
+
+Sites reordered by scraping-friendliness (server-rendered HTML first):
+
+| Priority | Site | Notes |
+|----------|------|-------|
+| 1 | WorldFootball.net | Pure HTML tables — most scraping-friendly |
+| 2 | FBRef | Sports Reference HTML data tables |
+| 3 | ESPN FC | Partial SSR, updated endpoints (`/standings/_/league/eng.1`) |
+| 4 | BBC Sport | Some SSR content |
+| 5 | Transfermarkt | SSR but aggressive bot detection |
+| 6 | Soccerway | Updated to `int.soccerway.com` |
+| 7 | Flashscore | JS SPA — limited HTML extraction |
+| 8 | SofaScore | JS SPA — limited HTML extraction |
+
+### Files Modified
+
+| File | Change |
+|------|--------|
+| `src/features/football_scraping/scraper.zig` | Rewrote `fetchUrl` with `std.http.Client`, added `patternsForSite`, threaded `Io`, added logging |
+| `src/features/football_scraping/handlers.zig` | Captured `Io`, DB job before scrape, comprehensive logging, proper error handling |
+| `src/features/football_scraping/sites.zig` | Reordered sites, updated endpoints, added descriptions about JS vs SSR |
+| `src/features/football_scraping/repository.zig` | All 19 `.to()` calls → `.{ .map = .name, .allocator = arena }` |
+| `src/features/football_scraping/templates.zig` | Added `job_detail_fragment` template |
+| `src/db/database.zig` | Added `QueryOpts` export, `column_names = true` on all queries |
+| `src/db/user_repository.zig` | Named mapping on all 3 `.to()` calls |
+| `src/http_server_main.zig` | Added `/scraper/reports/job/:id` route |
+| `docs/PROGRESS.md` | This section |
+
+### Test Results
+
+```
+Build Summary: 6/6 steps succeeded; 182/182 tests passed
+- 180 unit tests (main test suite)
+- 2 pg.zig dependency tests
+- Zero memory leaks
+```
+
+### Future Plans (Step 21+)
+
+| Feature | Description |
+|---------|-------------|
+| Async scraping | Use `io.async()` to scrape multiple sites concurrently within a single job |
+| Rate limiting | Per-domain request throttling to avoid being blocked |
+| Structured data extraction | Parse HTML tables into typed structs (standings, fixtures, scores) |
+| cron-style scheduling | Automatic periodic scraping via background task |
+| Data deduplication | Match/merge scraped data across multiple sources |
+| JavaScript rendering | Headless browser integration for JS-heavy sites (Flashscore, SofaScore) |
 
 ### Test Results
 
