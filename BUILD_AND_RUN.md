@@ -175,7 +175,10 @@ powershell -ExecutionPolicy Bypass -File test.ps1 -DbIntegration
 # Run benchmarks (ReleaseFast, measures throughput & latency)
 powershell -ExecutionPolicy Bypass -File test.ps1 -Benchmark
 
-# Run everything: unit + integration + db-integration + benchmark
+# Run stress benchmark (CPU & RAM profiling, generates visual HTML report)
+powershell -ExecutionPolicy Bypass -File test.ps1 -Stress
+
+# Run everything: unit + integration + db-integration + benchmark + stress
 powershell -ExecutionPolicy Bypass -File test.ps1 -All
 
 # Combine flags as needed
@@ -191,7 +194,8 @@ powershell -ExecutionPolicy Bypass -File test.ps1 -Integration -DbIntegration
 | `-Integration`    | Run integration tests (end-to-end HTTP over TCP)                 |
 | `-DbIntegration`  | Run database integration tests (requires PostgreSQL via Docker)  |
 | `-Benchmark`      | Run performance benchmarks (built with `-Doptimize=ReleaseFast`) |
-| `-All`            | Run all phases: unit, integration, db-integration, and benchmark |
+| `-Stress`         | Run stress benchmark with CPU & RAM profiling (generates visual HTML report) |
+| `-All`            | Run all phases: unit, integration, db-integration, benchmark, and stress |
 
 With no flags, only unit tests are run. Use `-DbIntegration` only when PostgreSQL is running.
 
@@ -203,6 +207,7 @@ With no flags, only unit tests are run. Use `-DbIntegration` only when PostgreSQ
 | **Integration** | 16  | Full HTTP request/response cycle over real TCP sockets |
 | **DB Integration** | 10 | CRUD, constraints, SQL injection safety (requires PostgreSQL) |
 | **Benchmark** | 6     | Throughput & latency: conn-per-req + keep-alive (ReleaseFast) |
+| **Stress**    | —     | CPU & RAM profiling under heavy load, visual HTML report |
 
 ### Zig Build Commands (without test.ps1)
 
@@ -222,3 +227,59 @@ zig build db-integration-test
 # Run benchmarks (use ReleaseFast for meaningful numbers)
 zig build benchmark -Doptimize=ReleaseFast
 ```
+
+---
+
+## Stress Benchmark (CPU & RAM Profiling)
+
+The stress benchmark launches the HTTP server under increasing concurrency,
+samples OS-level CPU and memory metrics every 250 ms, and generates an
+interactive HTML report with Chart.js graphs.
+
+### Quick Start
+
+```powershell
+# Run via the test runner
+powershell -ExecutionPolicy Bypass -File test.ps1 -Stress
+
+# Or run the standalone script directly
+powershell -ExecutionPolicy Bypass -File stress-benchmark.ps1
+```
+
+### Parameters
+
+| Parameter          | Description                                      | Default               |
+|--------------------|--------------------------------------------------|-----------------------|
+| `-Port`            | Port for the benchmark server                    | `18095`               |
+| `-Duration`        | Total load duration in seconds                   | `30`                  |
+| `-MaxConcurrency`  | Peak number of concurrent connections            | `200`                 |
+| `-SkipBuild`       | Skip the `zig build` step (use existing binary)  | off                   |
+| `-ReportPath`      | Output file name for the HTML report             | `benchmark-report.html` |
+
+### Examples
+
+```powershell
+# Default: 30 s, up to 200 concurrent connections
+powershell -ExecutionPolicy Bypass -File stress-benchmark.ps1
+
+# Longer run with higher concurrency
+powershell -ExecutionPolicy Bypass -File stress-benchmark.ps1 -Duration 60 -MaxConcurrency 500
+
+# Quick smoke test
+powershell -ExecutionPolicy Bypass -File stress-benchmark.ps1 -Duration 10 -MaxConcurrency 50
+
+# Custom port, skip rebuild
+powershell -ExecutionPolicy Bypass -File stress-benchmark.ps1 -Port 9090 -SkipBuild
+```
+
+### Output
+
+The report is saved to `benchmark-report.html` and opened automatically in your
+default browser. It includes:
+
+- **Summary cards** — total requests, errors, peak/avg RAM, peak/avg CPU, peak RPS
+- **Memory chart** — working set and private bytes over time
+- **CPU chart** — processor usage percentage over time
+- **Throughput chart** — requests/sec with concurrency overlay
+- **Threads & handles chart** — OS thread and handle count over time
+- **Combined overview** — normalized CPU, RAM, and RPS on a single chart

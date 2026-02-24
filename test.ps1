@@ -6,6 +6,7 @@
 #         powershell -ExecutionPolicy Bypass -File test.ps1 -Integration
 #         powershell -ExecutionPolicy Bypass -File test.ps1 -DbIntegration
 #         powershell -ExecutionPolicy Bypass -File test.ps1 -Benchmark
+#         powershell -ExecutionPolicy Bypass -File test.ps1 -Stress
 #         powershell -ExecutionPolicy Bypass -File test.ps1 -All
 # ------------------------------------------------------------------
 
@@ -14,6 +15,7 @@ param(
     [switch]$Integration,
     [switch]$DbIntegration,
     [switch]$Benchmark,
+    [switch]$Stress,
     [switch]$All
 )
 
@@ -53,10 +55,11 @@ function Write-Info {
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
 
 # -- Determine what to run -----------------------------------------
-$runUnit            = (-not $Integration -and -not $DbIntegration -and -not $Benchmark) -or $All
+$runUnit            = (-not $Integration -and -not $DbIntegration -and -not $Benchmark -and -not $Stress) -or $All
 $runIntegration     = $Integration -or $All
 $runDbIntegration   = $DbIntegration -or $All
 $runBenchmark       = $Benchmark -or $All
+$runStress          = $Stress -or $All
 
 $globalExit = 0
 
@@ -348,6 +351,32 @@ if ($runBenchmark) {
     }
 }
 
+# ===================================================================
+#  PHASE 5: Stress Benchmark (CPU & RAM under load, visual report)
+# ===================================================================
+if ($runStress) {
+    Write-Header "Stress Benchmark  (CPU & RAM profiling)"
+
+    Write-Host "  Launching stress-benchmark.ps1..." -ForegroundColor Yellow
+
+    $stressScript = Join-Path $PSScriptRoot "stress-benchmark.ps1"
+    if (Test-Path $stressScript) {
+        & powershell -ExecutionPolicy Bypass -File $stressScript
+        $stressExit = $LASTEXITCODE
+
+        if ($stressExit -ne 0) {
+            $globalExit = 1
+            Write-Host ""
+            Write-Host "    $cross STRESS BENCHMARK FAILED" -ForegroundColor Red
+        } else {
+            Write-Host ""
+            Write-Host "    $check Stress benchmark complete (report: benchmark-report.html)" -ForegroundColor Green
+        }
+    } else {
+        Write-Host "    $cross stress-benchmark.ps1 not found" -ForegroundColor Red
+    }
+}
+
 $sw.Stop()
 $elapsed = $sw.Elapsed
 
@@ -362,6 +391,7 @@ if ($runUnit)            { $phases += "unit" }
 if ($runIntegration)     { $phases += "integration" }
 if ($runDbIntegration)   { $phases += "db-integration" }
 if ($runBenchmark)       { $phases += "benchmark" }
+if ($runStress)          { $phases += "stress" }
 
 $phasesStr = $phases -join " + "
 
