@@ -18,6 +18,8 @@ pub const parser = @import("parser.zig");
 pub const CpuPool = @import("thread_pool.zig");
 /// Static file serving with MIME detection and path sanitisation.
 pub const Static = @import("static.zig");
+/// Comptime middleware pipeline (logging, CORS, security headers, etc.).
+pub const Middleware = @import("middleware.zig");
 
 // Re-export common std.http types for convenience
 const std = @import("std");
@@ -37,4 +39,5 @@ test {
     _ = Request;
     _ = Response;
     _ = Static;
+    _ = Middleware;
 }

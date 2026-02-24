@@ -65,6 +65,7 @@ pub const Match = struct {
 /// Compile a route pattern into segments at comptime.
 fn compilePattern(comptime pattern: []const u8) []const Segment {
     comptime {
+        @setEvalBranchQuota(100_000);
         var segments: []const Segment = &.{};
         var iter = mem.splitScalar(u8, pattern, '/');
 

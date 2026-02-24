@@ -11,6 +11,9 @@ pub const db = @import("db/db.zig");
 /// Comptime HTML template engine and htmx integration.
 pub const html = @import("html/html.zig");
 
+/// Football web scraping feature module.
+pub const football_scraping = @import("features/football_scraping/football_scraping.zig");
+
 /// This is a documentation comment to explain the `printAnotherMessage` function below.
 ///
 /// Accepting an `Io.Writer` instance is a handy way to write reusable code.
@@ -31,4 +34,5 @@ test {
     // Pull in tests from all submodules
     _ = http;
     _ = html;
+    _ = football_scraping;
 }

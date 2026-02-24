@@ -11,30 +11,73 @@ const std = @import("std");
 const http = @import("zzigtop").http;
 const db = @import("zzigtop").db;
 const html = @import("zzigtop").html;
+const scraper_handlers = @import("zzigtop").football_scraping.Handlers;
+const Middleware = http.Middleware;
 const pg = @import("pg");
 
+/// Global middleware stack applied to all routes.
+/// Logs every request and adds standard security headers.
+fn withMiddleware(comptime handler: Middleware.HandlerFn) Middleware.HandlerFn {
+    return Middleware.chain(handler, &.{ Middleware.logging, Middleware.securityHeaders });
+}
+
+/// API middleware: logging + CORS + security + no-cache.
+const api_cors = Middleware.Cors.init(.{});
+fn withApiMiddleware(comptime handler: Middleware.HandlerFn) Middleware.HandlerFn {
+    return Middleware.chain(handler, &.{ Middleware.logging, api_cors, Middleware.securityHeaders, Middleware.noCache });
+}
+
 /// Comptime-defined routes — compiled into an optimized match table.
+/// Routes use middleware wrappers for cross-cutting concerns:
+///   - `withMiddleware`: logging + security headers (general routes)
+///   - `withApiMiddleware`: logging + CORS + security + no-cache (API routes)
 const router = http.Router.init(.{
-    .{ .GET, "/", handleIndex },
-    .{ .GET, "/health", handleHealth },
-    .{ .GET, "/hello/:name", handleHello },
-    .{ .POST, "/echo", handleEcho },
-    .{ .POST, "/api/echo-json", handleEchoJson },
-    .{ .GET, "/dashboard/:id", handleDashboard },
-    .{ .GET, "/metrics", handleMetrics },
-    .{ .GET, "/search", handleSearch },
-    // ---- REST API: Users (Step 13) ----
-    .{ .GET, "/api/users", handleListUsers },
-    .{ .GET, "/api/users/:id", handleGetUser },
-    .{ .POST, "/api/users", handleCreateUser },
-    .{ .PUT, "/api/users/:id", handleUpdateUser },
-    .{ .DELETE, "/api/users/:id", handleDeleteUser },
+    .{ .GET, "/", withMiddleware(handleIndex) },
+    .{ .GET, "/health", withMiddleware(handleHealth) },
+    .{ .GET, "/hello/:name", withMiddleware(handleHello) },
+    .{ .POST, "/echo", withMiddleware(handleEcho) },
+    .{ .POST, "/api/echo-json", withApiMiddleware(handleEchoJson) },
+    .{ .GET, "/dashboard/:id", withMiddleware(handleDashboard) },
+    .{ .GET, "/metrics", withApiMiddleware(handleMetrics) },
+    .{ .GET, "/search", withApiMiddleware(handleSearch) },
+    // ---- REST API: Users (Step 13) — with CORS + no-cache ----
+    .{ .GET, "/api/users", withApiMiddleware(handleListUsers) },
+    .{ .GET, "/api/users/:id", withApiMiddleware(handleGetUser) },
+    .{ .POST, "/api/users", withApiMiddleware(handleCreateUser) },
+    .{ .PUT, "/api/users/:id", withApiMiddleware(handleUpdateUser) },
+    .{ .DELETE, "/api/users/:id", withApiMiddleware(handleDeleteUser) },
+    // ---- CORS Preflight for API routes ----
+    .{ .OPTIONS, "/api/users", Middleware.Cors.preflight(.{}) },
+    .{ .OPTIONS, "/api/users/:id", Middleware.Cors.preflight(.{}) },
+    .{ .OPTIONS, "/api/echo-json", Middleware.Cors.preflight(.{}) },
     // ---- htmx + Template Demo (Step 17) ----
-    .{ .GET, "/htmx", handleHtmxDemo },
-    .{ .GET, "/htmx/time", handleHtmxTime },
-    .{ .POST, "/htmx/counter", handleHtmxCounter },
-    .{ .GET, "/htmx/users", handleHtmxUsers },
-    .{ .GET, "/htmx/search", handleHtmxSearch },
+    .{ .GET, "/htmx", withMiddleware(handleHtmxDemo) },
+    .{ .GET, "/htmx/time", withMiddleware(handleHtmxTime) },
+    .{ .POST, "/htmx/counter", withMiddleware(handleHtmxCounter) },
+    .{ .GET, "/htmx/users", withMiddleware(handleHtmxUsers) },
+    .{ .GET, "/htmx/search", withMiddleware(handleHtmxSearch) },
+    // ---- Football Scraper (Step 18) — with logging + security ----
+    .{ .GET, "/scraper", withMiddleware(scraper_handlers.handleDashboard) },
+    .{ .GET, "/scraper/dashboard-content", withMiddleware(scraper_handlers.handleDashboardContent) },
+    .{ .POST, "/scraper/start", withMiddleware(scraper_handlers.handleStartScrape) },
+    .{ .GET, "/scraper/progress", withMiddleware(scraper_handlers.handleProgress) },
+    .{ .GET, "/scraper/sites", withMiddleware(scraper_handlers.handleSites) },
+    .{ .GET, "/scraper/sites-content", withMiddleware(scraper_handlers.handleSitesContent) },
+    .{ .PUT, "/scraper/api/sites/:id/toggle", withApiMiddleware(scraper_handlers.handleToggleSite) },
+    .{ .GET, "/scraper/results", withMiddleware(scraper_handlers.handleResults) },
+    .{ .GET, "/scraper/results-content", withMiddleware(scraper_handlers.handleResultsContent) },
+    .{ .GET, "/scraper/results/competitions", withMiddleware(scraper_handlers.handleResultsCompetitions) },
+    .{ .GET, "/scraper/results/teams", withMiddleware(scraper_handlers.handleResultsTeams) },
+    .{ .GET, "/scraper/results/matches", withMiddleware(scraper_handlers.handleResultsMatches) },
+    .{ .GET, "/scraper/results/players", withMiddleware(scraper_handlers.handleResultsPlayers) },
+    .{ .GET, "/scraper/results/injuries", withMiddleware(scraper_handlers.handleResultsInjuries) },
+    .{ .GET, "/scraper/reports", withMiddleware(scraper_handlers.handleReports) },
+    .{ .GET, "/scraper/reports-content", withMiddleware(scraper_handlers.handleReportsContent) },
+    .{ .GET, "/scraper/reports/jobs", withMiddleware(scraper_handlers.handleReportsJobs) },
+    .{ .GET, "/scraper/recent-jobs", withMiddleware(scraper_handlers.handleRecentJobs) },
+    .{ .GET, "/scraper/api/sites", withApiMiddleware(scraper_handlers.handleApiSites) },
+    .{ .GET, "/scraper/api/jobs", withApiMiddleware(scraper_handlers.handleApiJobs) },
+    .{ .GET, "/scraper/api/progress", withApiMiddleware(scraper_handlers.handleApiProgress) },
 });
 
 /// Module-level pointer to server stats (set once during startup).
@@ -110,6 +153,8 @@ pub fn main(init: std.process.Init) !void {
         };
         if (database != null) {
             global_db = &database.?;
+            // Share DB reference with football scraper feature
+            scraper_handlers.setDatabase(&database.?);
         }
     }
 

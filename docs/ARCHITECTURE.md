@@ -59,6 +59,7 @@ root.zig (package root)
 │   ├── server.zig      → connection.zig, router.zig, static.zig
 │   ├── connection.zig  → request.zig, response.zig, router.zig, parser.zig, static.zig
 │   ├── router.zig      → request.zig, response.zig
+│   ├── middleware.zig   → request.zig, response.zig, router.zig (comptime chain)
 │   ├── request.zig     → parser.zig
 │   ├── response.zig    → static.zig
 │   ├── static.zig      → response.zig (MIME types, file I/O, path security)
@@ -155,6 +156,7 @@ src/
 │   ├── parser.zig        — SIMD-accelerated HTTP parsing utilities
 │   ├── static.zig        — Static file handler (MIME types, path security, Io.Dir)
 │   ├── thread_pool.zig   — CPU-bound task pool (FixedBufferAllocator workers)
+│   └── middleware.zig    — Comptime middleware pipeline (logging, CORS, security)
 ├── http_server_main.zig  — Executable entry point (HTTP server + REST API)
 ├── db_integration_test.zig — Database integration tests (requires PostgreSQL)
 ├── integration_test.zig  — HTTP integration tests

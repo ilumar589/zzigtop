@@ -518,6 +518,83 @@ The backing allocator flows through the entire stack:
 
 ---
 
+## Middleware (Step 19)
+
+Comptime middleware pipeline — wraps handlers with cross-cutting concerns at zero runtime overhead.
+
+### Types
+
+```zig
+/// Middleware function — wraps a handler, can short-circuit by not calling `next`.
+pub const Fn = *const fn (*Request, *Response, Io, next: HandlerFn) anyerror!void;
+
+/// Compose middleware at comptime. Middleware[0] is outermost.
+pub fn chain(comptime handler: HandlerFn, comptime middleware: []const Fn) HandlerFn;
+```
+
+### Built-in Middleware
+
+| Function | Description |
+|----------|-------------|
+| `Middleware.logging` | Logs `METHOD /path => STATUS [Nms]` to stderr |
+| `Middleware.securityHeaders` | Adds X-Content-Type-Options, X-Frame-Options, X-XSS-Protection, Referrer-Policy, Permissions-Policy |
+| `Middleware.Cors.init(config)` | CORS headers + OPTIONS preflight (short-circuits) |
+| `Middleware.Cors.preflight(config)` | Standalone OPTIONS handler for explicit routes |
+| `Middleware.noCache` | Cache-Control: no-store + Pragma: no-cache |
+| `Middleware.requestTiming` | Measures handler duration |
+| `Middleware.requestStart` | Adds X-Request-Start nanosecond timestamp header |
+
+### Usage
+
+```zig
+const Middleware = http.Middleware;
+
+// Apply logging + security to all routes
+fn withMiddleware(comptime handler: Middleware.HandlerFn) Middleware.HandlerFn {
+    return Middleware.chain(handler, &.{ Middleware.logging, Middleware.securityHeaders });
+}
+
+// API routes: add CORS + no-cache
+const cors = Middleware.Cors.init(.{ .origin = "https://example.com" });
+fn withApiMiddleware(comptime handler: Middleware.HandlerFn) Middleware.HandlerFn {
+    return Middleware.chain(handler, &.{ Middleware.logging, cors, Middleware.securityHeaders, Middleware.noCache });
+}
+
+const router = http.Router.init(.{
+    .{ .GET, "/", withMiddleware(handleIndex) },
+    .{ .GET, "/api/users", withApiMiddleware(handleListUsers) },
+    .{ .OPTIONS, "/api/users", Middleware.Cors.preflight(.{}) },
+});
+```
+
+### CORS Configuration
+
+```zig
+const cors = Middleware.Cors.init(.{
+    .origin = "https://example.com",  // Default: "*"
+    .methods = "GET, POST",            // Default: "GET, POST, PUT, DELETE, PATCH, OPTIONS"
+    .headers = "Authorization",        // Default: "Content-Type, Authorization, X-Requested-With"
+    .max_age = "3600",                 // Default: "86400"
+    .allow_credentials = true,         // Default: false
+    .expose_headers = "X-Custom",      // Default: ""
+});
+```
+
+### Writing Custom Middleware
+
+```zig
+fn myAuth(req: *Request, res: *Response, io: Io, next: HandlerFn) anyerror!void {
+    const token = req.getHeader("authorization") orelse {
+        try res.sendJson(.unauthorized, "{\"error\":\"Missing token\"}");
+        return; // Short-circuit — don't call handler
+    };
+    _ = token; // validate token here...
+    return next(req, res, io); // Authorized — continue to handler
+}
+```
+
+---
+
 ## Performance Notes
 
 - **Zero-copy parsing:** Headers, URI, method are slices into the read buffer
@@ -532,11 +609,63 @@ See [PERFORMANCE.md](PERFORMANCE.md) for 18 detailed technique breakdowns.
 
 ---
 
+## Football Scraper Endpoints
+
+The football scraping feature provides a web UI and JSON API under `/scraper/*`.
+
+### Web UI (HTML + htmx)
+
+| Route | Method | Description |
+|-------|--------|-------------|
+| `/scraper` | GET | Dashboard — overview stats, quick-start, recent jobs |
+| `/scraper/start` | POST | Start a new scrape job (redirects to progress) |
+| `/scraper/progress` | GET | Live progress bar (htmx polls every 2s) |
+| `/scraper/sites` | GET | Site management — enable/disable data sources |
+| `/scraper/sites/:id/toggle` | POST | Toggle a site on/off |
+| `/scraper/results` | GET | Results overview — tabbed data tables |
+| `/scraper/results/competitions` | GET | Competitions table |
+| `/scraper/results/teams` | GET | Teams table |
+| `/scraper/results/matches` | GET | Matches table |
+| `/scraper/results/players` | GET | Players table |
+| `/scraper/results/injuries` | GET | Injuries table |
+| `/scraper/reports` | GET | Job history & error reports |
+| `/scraper/reports/jobs` | GET | Job list fragment (htmx partial) |
+| `/scraper/recent-jobs` | GET | Recent jobs fragment (for dashboard polling) |
+
+### JSON API
+
+| Route | Method | Description |
+|-------|--------|-------------|
+| `/scraper/api/sites` | GET | All sites with enabled status |
+| `/scraper/api/jobs` | GET | All scrape job records |
+| `/scraper/api/progress` | GET | Current scrape progress |
+
+### htmx Integration
+
+- **Progress polling:** Dashboard and progress pages use `hx-trigger="every 2s"` to poll `/scraper/progress`
+- **Site toggling:** Toggle buttons use `hx-post` with `hx-swap="outerHTML"` for instant feedback
+- **Partial updates:** htmx requests (detected via `HX-Request` header) receive HTML fragments; browser requests get full pages
+
+### Data Model
+
+```
+scrape_jobs ──< raw_scrape_data
+competitions ──< matches
+teams ──< players
+teams ──< injuries
+matches ──< match_events
+competitions ──< standings >── teams
+```
+
+See [FOOTBALL_SCRAPING_PLAN.md](FOOTBALL_SCRAPING_PLAN.md) for the full implementation plan.
+
+---
+
 ## File Layout
 
 ```
 src/
-├── root.zig              — Package root (exports http + db modules)
+├── root.zig              — Package root (exports http, db, html, football_scraping)
 ├── main.zig              — Default entry point (not the server)
 ├── http_server_main.zig  — HTTP server entry point + all handlers
 ├── integration_test.zig  — HTTP integration tests (standalone executable)
@@ -552,8 +681,22 @@ src/
 │   ├── parser.zig        — SIMD HTTP/1 parser (zero-copy)
 │   ├── static.zig        — Static file handler (MIME, security, caching)
 │   └── thread_pool.zig   — CPU work pool (FixedBufferAllocator per worker)
-└── db/
-    ├── db.zig            — Database module root
-    ├── database.zig      — Connection pool wrapper (pg.zig)
-    └── user_repository.zig — User CRUD (parameterized queries)
+├── html/
+│   ├── html.zig          — Module root (Template + Htmx)
+│   ├── template.zig      — Comptime HTML template engine
+│   └── htmx.zig          — htmx request/response helpers
+├── db/
+│   ├── db.zig            — Database module root
+│   ├── database.zig      — Connection pool wrapper (pg.zig)
+│   └── user_repository.zig — User CRUD (parameterized queries)
+└── features/
+    └── football_scraping/
+        ├── football_scraping.zig — Module root (re-exports all submodules)
+        ├── types.zig             — Data types (jobs, teams, matches, etc.)
+        ├── sites.zig             — 8 football data source definitions
+        ├── parser.zig            — HTML extraction utilities
+        ├── scraper.zig           — Scrape engine with atomic progress
+        ├── repository.zig        — PostgreSQL CRUD for 9 tables
+        ├── templates.zig         — Comptime HTML templates for UI
+        └── handlers.zig          — 21 HTTP route handlers
 ```

@@ -2,9 +2,9 @@
 
 ## Project Progress Tracker
 
-> **Last Updated:** 2026-02-23  
+> **Last Updated:** 2026-02-24  
 > **Zig Version:** 0.16.0-dev.2535+b5bd49460  
-> **Status:** STEP 17 COMPLETE — Comptime HTML templates + htmx integration
+> **Status:** STEP 19 COMPLETE — Comptime middleware pipeline
 
 ---
 
@@ -57,14 +57,14 @@
 | | 15-6: Wire into `http_server_main.zig` | ✅ COMPLETE |
 | | 15-7: Integration tests + documentation | ✅ COMPLETE |
 | | 15-8: Memory safety audit — fix leaks, add leak tests (90/90) | ✅ COMPLETE |
-| 16 | Query parameter parsing | ⏳ IN PROGRESS |
-| | 16-1: Split path/query in `fromHttpHead()` + `raw_query` field | 🔲 |
-| | 16-2: `percentDecode()` utility function | 🔲 |
-| | 16-3: `parseQueryParams()` — lazy parser with caching | 🔲 |
-| | 16-4: `queryParam(name)` — single value lookup | 🔲 |
-| | 16-5: `queryParamAll(name)` — multi-value lookup | 🔲 |
-| | 16-6: Unit tests for all query param features | 🔲 |
-| | 16-7: Demo handler + update docs (API.md, PROGRESS.md) | 🔲 |
+| 16 | Query parameter parsing | ✅ COMPLETE |
+| | 16-1: Split path/query in `fromHttpHead()` + `raw_query` field | ✅ COMPLETE |
+| | 16-2: `percentDecode()` utility function | ✅ COMPLETE |
+| | 16-3: `parseQueryParams()` — lazy parser with caching | ✅ COMPLETE |
+| | 16-4: `queryParam(name)` — single value lookup | ✅ COMPLETE |
+| | 16-5: `queryParamAll(name)` — multi-value lookup | ✅ COMPLETE |
+| | 16-6: Unit tests for all query param features | ✅ COMPLETE |
+| | 16-7: Demo handler + update docs (API.md, PROGRESS.md) | ✅ COMPLETE |
 | 17 | Comptime HTML templates + htmx integration | ✅ COMPLETE |
 | | 17-1: `src/html/template.zig` — comptime template parser + renderer | ✅ COMPLETE |
 | | 17-2: `src/html/htmx.zig` — htmx request detection + response headers | ✅ COMPLETE |
@@ -75,6 +75,27 @@
 | | 17-7: Demo handlers in `http_server_main.zig` (time, counter, users, search) | ✅ COMPLETE |
 | | 17-8: Unit tests (25+ template tests, htmx detection tests) | ✅ COMPLETE |
 | | 17-9: Documentation (PROGRESS.md) | ✅ COMPLETE |
+| 18 | Football web scraping feature | ✅ COMPLETE |
+| | 18-1: Data types module (`types.zig` — jobs, teams, matches, etc.) | ✅ COMPLETE |
+| | 18-2: Sites registry (`sites.zig` — 8 football data sources) | ✅ COMPLETE |
+| | 18-3: HTML parser utilities (`parser.zig` — tag extraction, JSON-LD) | ✅ COMPLETE |
+| | 18-4: Scrape engine (`scraper.zig` — fetch, parse, atomic progress) | ✅ COMPLETE |
+| | 18-5: Database repository (`repository.zig` — CRUD for all tables) | ✅ COMPLETE |
+| | 18-6: Comptime templates (`templates.zig` — dashboard, progress, results, reports) | ✅ COMPLETE |
+| | 18-7: HTTP handlers (`handlers.zig` — 21 routes under `/scraper/*`) | ✅ COMPLETE |
+| | 18-8: Database schema (`init.sql` — 9 new tables with indexes) | ✅ COMPLETE |
+| | 18-9: CSS stylesheet (`scraper.css` — responsive scraper UI) | ✅ COMPLETE |
+| | 18-10: Wire into server (`root.zig`, `http_server_main.zig`, `router.zig`) | ✅ COMPLETE |
+| | 18-11: Tests (166/166 pass, zero leaks) + documentation | ✅ COMPLETE |
+| 19 | Comptime middleware pipeline | ✅ COMPLETE |
+| | 19-1: `middleware.zig` — core types (`Fn`, `HandlerFn`) + `chain()` comptime combinator | ✅ COMPLETE |
+| | 19-2: Logging middleware (method, path, status, duration) | ✅ COMPLETE |
+| | 19-3: Security headers middleware (X-Content-Type-Options, X-Frame-Options, etc.) | ✅ COMPLETE |
+| | 19-4: CORS middleware (`Cors.init(config)` + `Cors.preflight(config)`) | ✅ COMPLETE |
+| | 19-5: No-cache middleware (Cache-Control, Pragma) | ✅ COMPLETE |
+| | 19-6: Request timing middleware (X-Request-Start header) | ✅ COMPLETE |
+| | 19-7: Wire into `http.zig` exports + apply to all routes in `http_server_main.zig` | ✅ COMPLETE |
+| | 19-8: Unit tests (16 tests, 182/182 total) + documentation | ✅ COMPLETE |
 
 ---
 
@@ -1878,3 +1899,217 @@ fn handleUsers(req: *Request, res: *Response, _: Io) !void {
 | `/htmx/counter` | POST | Increment counter, return updated HTML |
 | `/htmx/users` | GET | User table rows via `{{#each}}` template |
 | `/htmx/search?q=...` | GET | Live search with debounced input |
+
+---
+
+## Step 18: Football Web Scraping Feature (COMPLETE)
+
+**What was done:**
+
+Built a comprehensive football (soccer) web scraping module under `src/features/football_scraping/` with full UI, database storage, and progress tracking.
+
+### Architecture
+
+The feature follows a two-phase data pipeline:
+1. **Raw Phase:** Fetch HTML from football sites → store raw JSON in `raw_scrape_data` table
+2. **Normalized Phase:** Parse raw data → store in relational tables (competitions, teams, matches, players, injuries, standings)
+
+### Module Structure
+
+```
+src/features/football_scraping/
+├── football_scraping.zig   — Module root (re-exports all submodules)
+├── types.zig               — Data types: ScrapeJob, Competition, Team, Match, Player, Injury, Standing
+├── sites.zig               — Registry of 8 football data sources (ESPN, BBC, Transfermarkt, etc.)
+├── parser.zig              — HTML extraction utilities (tag content, attributes, JSON-LD, score parsing)
+├── scraper.zig             — Scrape engine with atomic Progress for htmx polling
+├── repository.zig          — PostgreSQL CRUD for all 9 football tables
+├── templates.zig           — Comptime HTML templates (dashboard, progress, results, reports)
+└── handlers.zig            — 21 HTTP route handlers under /scraper/*
+```
+
+### Data Sources
+
+| Site | Category | Description |
+|------|----------|-------------|
+| ESPN FC | scores | Live scores, match results, league tables |
+| BBC Sport | scores | UK-focused scores and reports |
+| Transfermarkt | transfers | Player values, transfer history |
+| Flashscore | scores | Multi-league live scores |
+| Soccerway | statistics | Detailed match and league stats |
+| WorldFootball | historical | Historical results and archives |
+| FBRef | analytics | Advanced analytics and xG data |
+| SofaScore | ratings | Player ratings and match stats |
+
+### Database Schema (9 new tables)
+
+| Table | Purpose |
+|-------|---------|
+| `scrape_jobs` | Track scraping job runs with status and timestamps |
+| `raw_scrape_data` | Store raw JSON before normalization |
+| `competitions` | Leagues and tournaments (Premier League, La Liga, etc.) |
+| `teams` | Clubs with metadata (venue, founded year) |
+| `players` | Roster data (position, nationality, market value) |
+| `matches` | Individual match records with scores |
+| `match_events` | Goals, cards, substitutions per match |
+| `injuries` | Current player injuries with expected return dates |
+| `standings` | League table positions and stats |
+
+### UI Pages (htmx-powered)
+
+| Page | URL | Features |
+|------|-----|----------|
+| Dashboard | `/scraper` | Overview stats, quick-start button, recent jobs |
+| Progress | `/scraper/progress` | Real-time progress bar (polled every 2s via htmx) |
+| Sites | `/scraper/sites` | Enable/disable sites with toggle buttons |
+| Results | `/scraper/results` | Tabbed view of competitions, teams, matches, players, injuries |
+| Reports | `/scraper/reports` | Job history, success/error reports |
+
+### API Endpoints (JSON)
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/scraper/api/sites` | GET | List all sites with enabled status |
+| `/scraper/api/jobs` | GET | List all scrape jobs |
+| `/scraper/api/progress` | GET | Current scrape progress (for polling) |
+
+### Key Design Decisions
+
+| Decision | Rationale |
+|----------|-----------|
+| Simulated `fetchUrl` | Allows full pipeline testing without real HTTP; real client will use `std.http.Client` or raw TCP+TLS |
+| Atomic progress counters | Lock-free htmx polling — multiple concurrent readers, single writer |
+| Two-phase storage | Raw JSON preserved for debugging; normalized data for queries |
+| Comptime templates | All HTML parsed at compile time — zero runtime parsing overhead |
+| Arena-friendly | All per-request allocations cleaned up in O(1) when arena drops |
+
+### Files Created / Modified
+
+| File | Change |
+|------|--------|
+| `src/features/football_scraping/football_scraping.zig` | **NEW** — Module root |
+| `src/features/football_scraping/types.zig` | **NEW** — All data types (4 tests) |
+| `src/features/football_scraping/sites.zig` | **NEW** — 8 site definitions (4 tests) |
+| `src/features/football_scraping/parser.zig` | **NEW** — HTML extraction utils (6 tests) |
+| `src/features/football_scraping/scraper.zig` | **NEW** — Scrape engine with progress (4 tests) |
+| `src/features/football_scraping/repository.zig` | **NEW** — Database CRUD for 9 tables |
+| `src/features/football_scraping/templates.zig` | **NEW** — 15+ comptime HTML templates |
+| `src/features/football_scraping/handlers.zig` | **NEW** — 21 route handlers |
+| `public/css/scraper.css` | **NEW** — Full responsive CSS for scraper UI |
+| `docker/init.sql` | Added 9 new tables with indexes |
+| `src/root.zig` | Added `football_scraping` module export |
+| `src/http_server_main.zig` | Added 21 scraper routes + DB wiring |
+| `src/html/template.zig` | Added `@setEvalBranchQuota(100_000)` for larger templates |
+| `src/http/router.zig` | Added `@setEvalBranchQuota(100_000)` for 40+ routes |
+| `docs/FOOTBALL_SCRAPING_PLAN.md` | **NEW** — Detailed implementation plan |
+| `docs/PROGRESS.md` | This section |
+
+### Test Results
+
+```
+Build Summary: 6/6 steps succeeded; 166/166 tests passed
+- 164 unit tests (main test suite)
+- 2 pg.zig dependency tests
+- Zero memory leaks
+```
+
+---
+
+## Step 19: Comptime Middleware Pipeline (COMPLETE)
+
+**What was done:**
+
+Built a comptime middleware system that wraps handlers with cross-cutting concerns at **zero runtime overhead**. Middleware is composed at compile time — the resulting function pointers are just as fast as direct handler calls.
+
+### Core Design
+
+```zig
+/// Middleware function type — wraps a handler, can short-circuit.
+pub const Fn = *const fn (*Request, *Response, Io, next: HandlerFn) anyerror!void;
+
+/// Compose middleware at comptime (recursive chain building).
+pub fn chain(comptime handler: HandlerFn, comptime middleware: []const Fn) HandlerFn;
+```
+
+Execution order for `chain(handler, &.{ A, B, C })`:
+```
+A.before → B.before → C.before → handler → C.after → B.after → A.after
+```
+
+### Built-in Middleware
+
+| Middleware | Purpose |
+|------------|---------|
+| `logging` | Logs `METHOD /path => STATUS [Nms]` to stderr with duration |
+| `securityHeaders` | Adds X-Content-Type-Options, X-Frame-Options, X-XSS-Protection, Referrer-Policy, Permissions-Policy |
+| `Cors.init(config)` | Adds CORS headers + handles OPTIONS preflight (short-circuits) |
+| `Cors.preflight(config)` | Standalone handler for explicit OPTIONS routes |
+| `noCache` | Adds Cache-Control: no-store + Pragma: no-cache |
+| `requestTiming` | Measures handler duration (for logging pipelines) |
+| `requestStart` | Adds X-Request-Start header with nanosecond timestamp |
+
+### Usage Pattern
+
+```zig
+const Middleware = http.Middleware;
+
+// Global middleware helper — applied to all routes.
+fn withMiddleware(comptime handler: Middleware.HandlerFn) Middleware.HandlerFn {
+    return Middleware.chain(handler, &.{ Middleware.logging, Middleware.securityHeaders });
+}
+
+// API middleware — adds CORS + no-cache on top.
+const api_cors = Middleware.Cors.init(.{});
+fn withApiMiddleware(comptime handler: Middleware.HandlerFn) Middleware.HandlerFn {
+    return Middleware.chain(handler, &.{ Middleware.logging, api_cors, Middleware.securityHeaders, Middleware.noCache });
+}
+
+const router = http.Router.init(.{
+    .{ .GET, "/", withMiddleware(handleIndex) },
+    .{ .GET, "/api/users", withApiMiddleware(handleListUsers) },
+    .{ .OPTIONS, "/api/users", Middleware.Cors.preflight(.{}) },
+});
+```
+
+### CORS Configuration
+
+```zig
+const cors = Middleware.Cors.init(.{
+    .origin = "https://example.com",    // Default: "*"
+    .methods = "GET, POST",              // Default: "GET, POST, PUT, DELETE, PATCH, OPTIONS"
+    .headers = "Authorization",          // Default: "Content-Type, Authorization, X-Requested-With"
+    .max_age = "3600",                   // Default: "86400"
+    .allow_credentials = true,           // Default: false
+    .expose_headers = "X-Custom",        // Default: ""
+});
+```
+
+### Key Design Decisions
+
+| Decision | Rationale |
+|----------|-----------|
+| Comptime-only composition | Zero runtime overhead — middleware chain is resolved entirely at compile time; resulting function pointer is indistinguishable from a direct handler call |
+| Recursive chain building | Clean recursive pattern where each anonymous struct captures comptime-known values; works naturally with Zig's comptime evaluation |
+| Middleware can short-circuit | CORS preflight, auth rejection, rate limiting — just don't call `next` |
+| Configurable CORS via `Cors.init(config)` | Config is comptime struct — all values baked into the generated code |
+| Separate `Cors.preflight()` handler | OPTIONS requests need explicit routes in the comptime router; preflight handler is a standalone `HandlerFn` |
+| `withMiddleware()` / `withApiMiddleware()` pattern | Makes it trivial to apply consistent middleware stacks across all routes |
+
+### Files Created / Modified
+
+| File | Change |
+|------|--------|
+| `src/http/middleware.zig` | **NEW** — Core types, `chain()` combinator, 6 built-in middleware, 16 tests |
+| `src/http/http.zig` | Added `pub const Middleware = @import("middleware.zig")` + test import |
+| `src/http_server_main.zig` | Applied `withMiddleware` / `withApiMiddleware` to all 45+ routes; added CORS preflight routes |
+| `docs/PROGRESS.md` | This section |
+| `docs/API.md` | Middleware documentation |
+
+### Test Results
+
+```
+Build Summary: 6/6 steps succeeded; 182/182 tests passed
+- 180 unit tests (main test suite, including 16 new middleware tests)
+- 2 pg.zig dependency tests
+- Zero memory leaks
+```

@@ -117,6 +117,7 @@ const Node = struct {
 ///   const Tmpl = Template.compile("Hello, {{name}}!");
 ///   const html = try Tmpl.render(allocator, .{ .name = "World" });
 pub fn compile(comptime source: []const u8) type {
+    @setEvalBranchQuota(100_000);
     const nodes = comptime parseAll(source);
     return CompiledTemplate(nodes);
 }
